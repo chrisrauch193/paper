@@ -1,4 +1,4 @@
-# scripts/new_pipeline/01_enmeval_reproduction.R
+# scripts/new_pipeline/01_enmeval_models.R
 #-------------------------------------------------------------------------------
 # REPRODUCTION OF JIMENEZ PIPELINE USING ENMEVAL
 # 1. Host SDMs (Base)
@@ -104,7 +104,7 @@ run_enmeval_batch <- function(species_list, occ_df, env_stack, bg_n = 10000) {
     })
   }
   
-  return(list(maps = maps_stack, eval = eval_df, details = results_list))
+  return(list(maps = terra::wrap(maps_stack), eval = eval_df, details = results_list))
 }
 
 #===============================================================================
@@ -133,75 +133,121 @@ cat("Clownfish Env models saved.\n")
 
 #===============================================================================
 # PHASE 3: Clownfish HOST ONLY (Biotic Only)
+# Hypothesis: "Is the fish distribution driven PURELY by host availability?"
 # Input: ONLY the Max Suitability of Hosts. No Temp, No Salinity.
 #===============================================================================
 cat("\n--- Running PHASE 3: Clownfish (Host Only) ---\n")
 
+# --- STEP A: PREPARE HOST MAPS ---
+# We must unwrap the Phase 1 maps to use them for calculation
+cat("Preparing Host Maps...\n")
+if (inherits(anemENM$maps, "PackedSpatRaster")) {
+  host_model_stack <- terra::unwrap(anemENM$maps)
+} else {
+  host_model_stack <- anemENM$maps
+}
+
+# Force map names to match the interaction matrix format (Underscores)
+names(host_model_stack) <- gsub(" ", "_", names(host_model_stack))
+names(host_model_stack) <- gsub("\\.", "_", names(host_model_stack))
+cat("Host Maps Ready:", length(names(host_model_stack)), "species available.\n")
+
+# Initialize Containers
 biotic_maps <- terra::rast()
 biotic_eval <- data.frame()
 amph_species <- unique(amph_occ$species)
 
+# --- STEP B: LOOP THROUGH FISH ---
 for (fish in amph_species) {
   cat("\nProcessing Host-Only:", fish, "...\n")
   
   # 1. Identify Hosts
+  # Clean fish name to match matrix rownames (Underscores)
   fish_clean <- gsub(" ", "_", fish)
-  if (!fish_clean %in% rownames(int_mat)) { cat("  Skipping: Not in matrix.\n"); next }
   
+  # Check existence in matrix
+  if (!fish_clean %in% rownames(int_mat)) { 
+    cat("  Skipping: Fish name '", fish_clean, "' not found in interaction matrix.\n", sep="")
+    next 
+  }
+  
+  # Get hosts with ANY association (> 0)
   hosts <- names(int_mat)[int_mat[fish_clean, ] > 0]
-  valid_hosts <- hosts[hosts %in% names(anemENM$maps)]
   
-  if (length(valid_hosts) == 0) { cat("  Skipping: No modeled hosts.\n"); next }
+  # Keep only hosts we actually modeled in Phase 1
+  valid_hosts <- hosts[hosts %in% names(host_model_stack)]
+  
+  if (length(valid_hosts) == 0) { 
+    cat("  Skipping: No modeled hosts found. (Required:", paste(hosts, collapse=", "), ")\n")
+    next 
+  }
+  
+  cat("  Hosts found:", paste(valid_hosts, collapse=", "), "\n")
   
   # 2. Create Biotic Layer (Max Suitability)
+  # Logic: "If the best host is 80% suitable here, the site is 80% suitable biotically."
   if (length(valid_hosts) == 1) {
-    biotic_layer <- anemENM$maps[[valid_hosts]]
+    biotic_layer <- host_model_stack[[valid_hosts]]
   } else {
-    host_stack <- anemENM$maps[[valid_hosts]]
-    biotic_layer <- terra::app(host_stack, fun = max, na.rm = TRUE)
+    sub_stack <- host_model_stack[[valid_hosts]]
+    biotic_layer <- terra::app(sub_stack, fun = max, na.rm = TRUE)
   }
   names(biotic_layer) <- "host_suitability"
   
   # 3. Stack (ONLY BIOTIC)
-  # ENMeval needs a raster stack, even if it's 1 layer
   env_input <- biotic_layer 
   
-  # 4. Run ENMeval
+  # 4. Prepare Occurrences & Background
   sp_occ <- amph_occ %>% filter(species == fish) %>% dplyr::select(x, y)
+  sp_occ$x <- as.numeric(sp_occ$x); sp_occ$y <- as.numeric(sp_occ$y)
+  
+  if (nrow(sp_occ) < 5) {
+    cat("  Skipping: Too few occurrences (<5)\n")
+    next
+  }
+  
   bg <- terra::spatSample(env_input, size = 10000, method = "random", na.rm = TRUE, xy = TRUE, values = FALSE)
   bg <- bg[, c("x", "y")]
   
-  if (nrow(sp_occ) < 5) next
-  
+  # 5. Run ENMeval
   tryCatch({
     mod <- ENMevaluate(occs = sp_occ, envs = env_input, bg = bg, 
                        algorithm = 'maxnet', partitions = 'block', 
-                       tune.args = list(fc = c("L", "LQ"), rm = 1:2), # Simpler tuning for 1 var
+                       tune.args = list(fc = c("L", "LQ"), rm = 1:2), # Simpler tuning for single variable
                        parallel = TRUE, numCores = 4, quiet = TRUE)
     
-    # Select Best & Predict
+    # Select Best Model
     best_res <- mod@results %>% filter(delta.AICc == 0) %>% slice(1)
     if(nrow(best_res) == 0) best_res <- mod@results %>% arrange(desc(auc.val.avg)) %>% slice(1)
     best_model <- mod@models[[as.numeric(rownames(best_res))]]
     
+    # Predict
     pred_map <- enm.maxnet@predict(best_model, env_input, other.settings = list(pred.type = "cloglog", doClamp = TRUE))
     names(pred_map) <- fish
     biotic_maps <- c(biotic_maps, pred_map)
     
-    stats <- data.frame(Species = fish, AUC_mean = best_res$auc.val.avg, CBI_mean = best_res$cbi.val.avg, Settings = paste0("fc:", best_res$fc, "_rm:", best_res$rm))
+    # Save Stats
+    stats <- data.frame(
+      Species = fish, 
+      AUC_mean = best_res$auc.val.avg, 
+      CBI_mean = best_res$cbi.val.avg, 
+      Settings = paste0("fc:", best_res$fc, "_rm:", best_res$rm)
+    )
     biotic_eval <- bind_rows(biotic_eval, stats)
     cat("  Success. AUC:", round(best_res$auc.val.avg, 3), "\n")
     
   }, error = function(e) { cat("  ERROR:", e$message, "\n") })
 }
 
-# Save Phase 3
-amphBioticOnly <- list(maps = biotic_maps, eval = biotic_eval)
+# Save Phase 3 (Wrapped)
+amphBioticOnly <- list(maps = terra::wrap(biotic_maps), eval = biotic_eval)
 saveRDS(amphBioticOnly, "./Rdata/amphBioticOnly.RDS")
 cat("Host-Only models saved.\n")
 
+
 #===============================================================================
 # PHASE 4: Clownfish COMBINED (Env + Host)
+# Hypothesis: "Realized Niche = Abiotic Niche + Host Availability"
 # Input: Environment Stack + Host Suitability Layer
 #===============================================================================
 cat("\n--- Running PHASE 4: Clownfish Combined (Biotic + Env) ---\n")
@@ -209,35 +255,44 @@ cat("\n--- Running PHASE 4: Clownfish Combined (Biotic + Env) ---\n")
 combined_maps <- terra::rast()
 combined_eval <- data.frame()
 
+# We reuse 'host_model_stack' from Phase 3, so we don't need to unwrap again.
+
 for (fish in amph_species) {
   cat("\nProcessing Combined:", fish, "...\n")
   
-  # 1. Identify Hosts (Same logic)
+  # 1. Identify Hosts (Same logic as above)
   fish_clean <- gsub(" ", "_", fish)
-  if (!fish_clean %in% rownames(int_mat)) next
+  
+  if (!fish_clean %in% rownames(int_mat)) { next }
+  
   hosts <- names(int_mat)[int_mat[fish_clean, ] > 0]
-  valid_hosts <- hosts[hosts %in% names(anemENM$maps)]
-  if (length(valid_hosts) == 0) next
+  valid_hosts <- hosts[hosts %in% names(host_model_stack)]
+  
+  if (length(valid_hosts) == 0) { next }
   
   # 2. Create Biotic Layer
   if (length(valid_hosts) == 1) {
-    biotic_layer <- anemENM$maps[[valid_hosts]]
+    biotic_layer <- host_model_stack[[valid_hosts]]
   } else {
-    host_stack <- anemENM$maps[[valid_hosts]]
-    biotic_layer <- terra::app(host_stack, fun = max, na.rm = TRUE)
+    sub_stack <- host_model_stack[[valid_hosts]]
+    biotic_layer <- terra::app(sub_stack, fun = max, na.rm = TRUE)
   }
   names(biotic_layer) <- "host_suitability"
   
-  # 3. Stack (COMBINED)
+  # 3. Stack (COMBINED: Env + Biotic)
+  # env_rast is Global, biotic_layer is Global. They stack perfectly.
   env_input <- c(env_rast, biotic_layer)
   
-  # 4. Run ENMeval
+  # 4. Prepare Occurrences & Background
   sp_occ <- amph_occ %>% filter(species == fish) %>% dplyr::select(x, y)
+  sp_occ$x <- as.numeric(sp_occ$x); sp_occ$y <- as.numeric(sp_occ$y)
+  
+  if (nrow(sp_occ) < 5) { next }
+  
   bg <- terra::spatSample(env_input, size = 10000, method = "random", na.rm = TRUE, xy = TRUE, values = FALSE)
   bg <- bg[, c("x", "y")]
   
-  if (nrow(sp_occ) < 5) next
-  
+  # 5. Run ENMeval
   tryCatch({
     mod <- ENMevaluate(occs = sp_occ, envs = env_input, bg = bg, 
                        algorithm = 'maxnet', partitions = 'block', 
@@ -253,16 +308,22 @@ for (fish in amph_species) {
     names(pred_map) <- fish
     combined_maps <- c(combined_maps, pred_map)
     
-    stats <- data.frame(Species = fish, AUC_mean = best_res$auc.val.avg, CBI_mean = best_res$cbi.val.avg, Settings = paste0("fc:", best_res$fc, "_rm:", best_res$rm))
+    # Save Stats
+    stats <- data.frame(
+      Species = fish, 
+      AUC_mean = best_res$auc.val.avg, 
+      CBI_mean = best_res$cbi.val.avg, 
+      Settings = paste0("fc:", best_res$fc, "_rm:", best_res$rm)
+    )
     combined_eval <- bind_rows(combined_eval, stats)
     cat("  Success. AUC:", round(best_res$auc.val.avg, 3), "\n")
     
   }, error = function(e) { cat("  ERROR:", e$message, "\n") })
 }
 
-# Save Phase 4
-amphEBM <- list(maps = combined_maps, eval = combined_eval)
-saveRDS(amphEBM, "./Rdata/amphEBMs.RDS") # Keeping paper's name convention for compatibility
+# Save Phase 4 (Wrapped)
+amphEBM <- list(maps = terra::wrap(combined_maps), eval = combined_eval)
+saveRDS(amphEBM, "./Rdata/amphEBMs.RDS")
 cat("Combined models saved.\n")
 
 cat("\n--- PIPELINE COMPLETE ---\n")

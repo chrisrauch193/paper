@@ -113,21 +113,21 @@ if(file.exists(file.path(rds_dir, "amphENMs.RDS"))) {
   all_metrics[["Phase2"]] <- extract_metrics(res, "Phase2_Clownfish_Env")
 }
 
-# 3. Clownfish Biotic Only (Host Only)
-if(file.exists(file.path(rds_dir, "amphBioticOnly.RDS"))) {
-  cat("\n--- Processing Clownfish Biotic Only Models ---\n")
-  res <- readRDS(file.path(rds_dir, "amphBioticOnly.RDS"))
-  plot_and_save(res, "Phase3_Clownfish_HostOnly", fig_dir)
-  all_metrics[["Phase3"]] <- extract_metrics(res, "Phase3_Clownfish_HostOnly")
-}
-
-# 4. Clownfish Combined
-if(file.exists(file.path(rds_dir, "amphEBMs.RDS"))) {
-  cat("\n--- Processing Clownfish Combined Models ---\n")
-  res <- readRDS(file.path(rds_dir, "amphEBMs.RDS"))
-  plot_and_save(res, "Phase4_Clownfish_Combined", fig_dir)
-  all_metrics[["Phase4"]] <- extract_metrics(res, "Phase4_Clownfish_Combined")
-}
+# # 3. Clownfish Biotic Only (Host Only)
+# if(file.exists(file.path(rds_dir, "amphBioticOnly.RDS"))) {
+#   cat("\n--- Processing Clownfish Biotic Only Models ---\n")
+#   res <- readRDS(file.path(rds_dir, "amphBioticOnly.RDS"))
+#   plot_and_save(res, "Phase3_Clownfish_HostOnly", fig_dir)
+#   all_metrics[["Phase3"]] <- extract_metrics(res, "Phase3_Clownfish_HostOnly")
+# }
+# 
+# # 4. Clownfish Combined
+# if(file.exists(file.path(rds_dir, "amphEBMs.RDS"))) {
+#   cat("\n--- Processing Clownfish Combined Models ---\n")
+#   res <- readRDS(file.path(rds_dir, "amphEBMs.RDS"))
+#   plot_and_save(res, "Phase4_Clownfish_Combined", fig_dir)
+#   all_metrics[["Phase4"]] <- extract_metrics(res, "Phase4_Clownfish_Combined")
+# }
 
 #-------------------------------------------------------------------------------
 # PART 3: SAVE METRICS SUMMARY

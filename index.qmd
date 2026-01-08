@@ -1,0 +1,20 @@
+---
+title: "Anemonefish Mutualism Analysis Results"
+format: html
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Drivers of Host Sea Anemone and Anemonefish Richness
+
+This section replicates the initial data loading and processing steps from the desert ant paper's results section, adapted for the anemonefish-anemone mutualism. We load the current predicted suitability rasters for host sea anemones and anemonefish (environmental-only models), calculate community richness, and crop them to the Indo-Pacific study area.
+
+```{r setup-libraries-and-config}
+#| label: setup-libraries-and-config
+#| message: false
+#| warning: false
+
+```
