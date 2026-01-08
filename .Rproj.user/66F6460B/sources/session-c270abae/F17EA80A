@@ -1,0 +1,26 @@
+{
+    "id": "F17EA80A",
+    "path": "~/a0236995/paper/scripts/visualize_original_paper_results.R",
+    "project_path": "scripts/visualize_original_paper_results.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1767844412377.0,
+    "source_on_save": false,
+    "relative_order": 7,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "142,34",
+        "scrollLine": "112"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1767844600,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1767844600835,
+    "read_only": false,
+    "read_only_alternatives": []
+}

@@ -1,0 +1,26 @@
+{
+    "id": "78B608A1",
+    "path": "~/a0236995/sdm_anemonefish/scripts/sdm_runs/06d_run_sdm_anemonefish_combined.R",
+    "project_path": null,
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1767838657769.0,
+    "source_on_save": false,
+    "relative_order": 3,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "485,80",
+        "scrollLine": "0"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1767751166,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1767751166,
+    "read_only": false,
+    "read_only_alternatives": []
+}

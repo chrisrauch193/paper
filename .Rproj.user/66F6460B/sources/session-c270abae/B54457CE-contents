@@ -1,0 +1,1558 @@
+library(ade4)
+library(data.table)
+library(prabclus)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ecospat)
+library(pROC)
+library(boot)
+library(foreach)
+library(doParallel)
+
+# reverse list
+reverse_list <- function (ll) 
+{
+  nms <- unique(unlist(lapply(ll, function(X) names(X))))
+  ll <- lapply(ll, function(X) setNames(X[nms], nms))
+  ll <- apply(do.call(rbind, ll), 2, as.list)
+  lapply(ll, function(X) X[!sapply(X, is.null)])
+}
+
+# Function to preprocess occurrences and filter species
+preprocess_occurrences <- function(occ) {
+  
+  species_counts <- table(occ[, 3])
+  
+  valid_species <- names(species_counts[species_counts >= 2])
+  
+  occ <- occ[occ[, 3] %in% valid_species, ]
+  
+  if (nrow(occ) == 0) stop("No species with sufficient occurrences.")
+  
+  occ$PA <- ifelse(ncol(occ) == 3, 1, occ$PA)  # Ensure PA column
+  
+  return(list(occ = occ, valid_species = valid_species))
+}
+
+postprocess_occurrences <- function(occ, env.scores, res = NULL){
+  
+  res <- ifelse(is.null(res), 
+                max(raster::res(raster::rasterFromXYZ(env.scores[,1:3]))),
+                res)
+  
+  sp_scores <- data.frame()
+  for (i in 1:nrow(occ)) {
+    
+    xi = occ[i,1]
+    yi = occ[i,2]
+    sp <- occ[i,3]
+    PA <- occ[i,4]
+    
+    dist <- sqrt((env.scores[,1] - xi)^2 + (env.scores[,2] - yi)^2)
+    min_dist <- min(dist)
+    
+    if (min_dist < res) {
+      sp_scores <- rbind(sp_scores, 
+                         cbind(env.scores[which(dist == min_dist)[1],1:4], 
+                               species = sp,
+                               PA = PA))
+    }
+  }
+  
+  return(sp_scores)
+}
+
+kernel_density_grid <- function (x, h = "href", R = 100, ext = NULL, env.mask = NULL, 
+                                 th = NULL, method = c("epa", "bivnorm")) {
+  method = method[1]
+  if (is.null(ext)) {
+    ext <- c(range(x[, 1]), range(x[, 2]))
+  }
+  xr <- data.frame(cbind((x[, 1] - ext[1])/abs(ext[2] - ext[1]), 
+                         (x[, 2] - ext[3])/abs(ext[4] - ext[3])))
+  mask <- adehabitatMA::ascgen(sp::SpatialPoints(cbind((0:(R))/R, 
+                                                       (0:(R)/R))), nrcol = R - 2, count = FALSE)
+  x.dens <- adehabitatHR::kernelUD(sp::SpatialPoints(xr[, 1:2]), 
+                                   h = h, grid = mask, kern = method)
+  x.dens <- raster::raster(xmn = ext[1], xmx = ext[2], ymn = ext[3], 
+                           ymx = ext[4], matrix(x.dens$ud, nrow = R))
+  if (!is.null(th)) {
+    th.value <- stats::quantile(raster::extract(x.dens, x), 
+                                th)
+    x.dens[x.dens < th.value] <- 0
+  }
+  if (!is.null(env.mask)) {
+    if (!raster::compareRaster(c(x.dens, env.mask), stopiffalse = FALSE)) {
+      x.dens <- raster::resample(x.dens, env.mask, method = "ngb")
+    }
+    x.dens <- x.dens * env.mask
+  }
+  return(x.dens)
+}
+
+
+raster_projection <- function (df, crs = 4326) {
+  
+  names = colnames(df)[-c(1:2)]
+  
+  x <- sort(unique(df[, 1]))
+  y <- sort(unique(df[, 2]))
+  dx <- diff(x)
+  dy <- diff(y)
+  is_regular_x <- all((round(dx/min(dx), 5) %% 1) < .Machine$double.eps^0.5)
+  is_regular_y <- all((round(dy/min(dy), 5) %% 1) < .Machine$double.eps^0.5)
+  
+  if (!is_regular_x || !is_regular_y) {
+    e <- c(min(df[,1]), max(df[,1]), min(df[,2]), max(df[,2]))
+    ras <- raster::raster(xmn = e[1], 
+                          xmx = e[2], 
+                          ymn = e[3], 
+                          ymx = e[4], crs = crs)
+    
+    ras <- sapply(names, function(i) 
+      raster::rasterize(df[,1:2], ras, field = df[, i], 
+                        fun = mean, na.rm = T))
+    
+    ras <- raster::stack(ras)
+    
+  }
+  else {
+    ras <- raster::rasterFromXYZ(df, crs = crs)
+  }
+  
+  return(ras)
+}
+
+prob_to_PA <- function(map, th) {
+  
+  if (raster::nlayers(map) != length(th)) {
+    stop("Number of Raster layers does not correspond to the number of thresholds given.")
+  }
+  
+  if (length(th) == 1) {
+    r <- map
+    
+    # apply threshold
+    r[r >= th] = 1
+    r[r < th] = 0
+    
+    return(r)
+  }
+  
+  if (is.null(names(th))) {
+    stop("th must be a named vector.")
+  }
+  
+  s <- raster::stack()
+  for (i in 1:length(th)){
+    
+    r <- map[[names(th)[i]]]
+    
+    # apply threshold
+    r[r >= th[i]] = 1
+    r[r < th[i]] = 0
+    
+    s <- raster::stack(s, r)
+  }
+  
+  return(s)
+  
+}
+
+# niche to distribution
+niche_to_dis <- function(env.scores, z, cor = FALSE, cluster = NULL) {
+  library(terra)
+  
+  # Define helper function for value extraction
+  extract_values <- function(z_item) {
+    if (cor) {
+      vals <- extract(z_item$z, z_item$glob) / extract(z_item$Z, z_item$glob)
+    } else {
+      vals <- extract(z_item$z, z_item$glob)
+    }
+    return(vals)
+  }
+  
+  # If no clustering is provided
+  if (is.null(cluster)) {
+    vals <- extract_values(z)
+    df <- cbind(env.scores[, 1:2], vals)
+  } 
+  else if (is.data.frame(cluster)) {
+    cluster_levels <- unique(cluster[, 3])
+    z_names <- names(z)
+    
+    # Check if all provided cluster regions exist in z
+    missing_regions <- setdiff(z_names, cluster_levels)
+    if (length(missing_regions) > 0) {
+      warning("Some regions of z are not included in the provided cluster: ", 
+              paste(missing_regions, collapse = ", "))
+    }
+    
+    # Initialize dataframe
+    df <- cbind(env.scores[, 1:2], vals = 0)
+    
+    for (e in intersect(z_names, cluster_levels)) {
+      reg <- which(cluster[, 3] == e)
+      df[reg, 3] <- extract_values(z[[e]])
+    }
+  } 
+  else {
+    stop("Invalid input: 'cluster' must be NULL or a dataframe.")
+  }
+  
+  # Normalize values and handle NA
+  max_val <- max(df[, 3], na.rm = TRUE)
+  df[, 3] <- ifelse(is.na(df[, 3]), 0, df[, 3] / max_val)
+  
+  return(df)
+}
+
+evaluate_model <- function(Fit., Obs., th = NULL, rep = 1000, metric = c("jaccard", "ACC", "TSS"), main = "", plot = TRUE, numCores = 1) {
+  
+  metric <- match.arg(metric)
+  
+  p <- Fit.[Fit. != 0]
+  a <- Fit.[Fit. == 0]
+  np <- length(p)
+  na <- length(a)
+  N <- na + np
+  
+  # Pearson Correlation
+  cor.test.res <- try(cor.test(Fit., Obs.), silent = TRUE)
+  cor <- ifelse(class(cor.test.res) != "try-error", cor.test.res$estimate, NA)
+  p.cor <- ifelse(class(cor.test.res) != "try-error", cor.test.res$p.value, NA)
+  
+  # Define threshold values
+  if (is.null(th)) {
+    th <- unique(round(c(a, p), 5))
+    th <- c(th[th > 0], max(th) + 1e-4)
+  } 
+  th <- sort(th)
+  
+  # Jaccard Similarity function
+  compute_jaccard <- function(x, y) {
+    sim <- try(prabclus::jaccard(as.matrix(cbind(x, y))), silent = TRUE)
+    if (inherits(sim, "try-error")) return(NA)
+    return(1 - sim[1, 2])
+  }
+  
+  compute_jaccard_vectorized <- function(Fit.n, Obs.) {
+    # Compute intersection (true positives)
+    tp <- rowSums((Fit.n == 1) & (Obs. == 1))
+    
+    # Compute union (all presence cases)
+    union_count <- rowSums((Fit.n == 1) | (Obs. == 1))
+    
+    # Avoid division by zero
+    union_count[union_count == 0] <- NA  # Prevent NaN issues
+    
+    # Compute Jaccard similarity
+    jacc.sim <- tp / union_count
+    
+    # Assign 0 where union was 0 (no presence at all)
+    jacc.sim[is.na(jacc.sim)] <- 0
+    
+    return(jacc.sim)
+  }
+  
+  # Compute TPR, TNR, Accuracy for both predicted and random models
+  compute_metrics <- function(dt) {
+    dt[, `:=` (
+      TPR = tp / (tp + fn),
+      TNR = tn / (tn + fp),
+      ACC = (tp + tn) / N,
+      TSS = tp / (tp + fn) + tn / (tn + fp) - 1
+    )]
+    dt[is.na(TPR), TPR := 0]
+    dt[is.na(TNR), TNR := 0]
+    dt[is.na(ACC), ACC := 0]
+    dt[is.na(TSS), TSS := 0]
+  }
+  
+  # Determine best threshold
+  get_best_threshold <- function(metric) {
+    
+    if (!is.null(res.n)) {
+      p.values <- sapply(th, function(t) {
+        observed_value <- res.[threshold == t, get(metric)]
+        null_values <- res.n[threshold == t, get(metric)]
+        
+        # Compute empirical p-value
+        (sum(null_values >= observed_value) + 1) / (length(null_values) + 1)
+      })
+      
+      list(threshold = th[which.max(res.[, get(metric)])],
+           p.value = p.values[which.max(res.[, get(metric)])])
+    } else {
+      list(threshold = th[which.max(res.[, get(metric)])],
+           p.value = NA)
+    }
+    
+  }
+  
+  # Preallocate matrices
+  res. <- data.table(threshold = th, tp = integer(length(th)), fp = integer(length(th)), 
+                     fn = integer(length(th)), tn = integer(length(th)), jaccard= numeric(length(th)))
+  
+  for (n in seq_along(th)) {
+    Fit.th <- as.integer(Fit. >= th[n])
+    
+    # Confusion matrix calculations
+    tp <- sum(Fit.th[Obs. == 1] == 1)
+    fp <- sum(Fit.th[Obs. == 0] == 1)
+    fn <- sum(Fit.th[Obs. == 1] == 0)
+    tn <- sum(Fit.th[Obs. == 0] == 0)
+    
+    # Store values
+    set(res., n, c("tp", "fp", "fn", "tn", "jaccard"),
+        list(tp, fp, fn, tn, compute_jaccard(Fit.th, Obs.)))
+  }
+  
+  res.[, `:=` (
+    TPR = tp / (tp + fn),
+    TNR = tn / (tn + fp),
+    ACC = (tp + tn) / N,
+    TSS = tp / (tp + fn) + tn / (tn + fp) - 1
+  )]
+  res.[is.na(TPR), TPR := 0]
+  res.[is.na(TNR), TNR := 0]
+  res.[is.na(ACC), ACC := 0]
+  res.[is.na(TSS), TSS := 0]  
+  res.[, test := "predicted"]
+  
+  ## Randomization 
+  if (!is.null(rep)) {
+    
+    cl <- makeCluster(numCores)
+    registerDoParallel(cl)
+    
+    # Define parallel computation
+    res.n <- foreach(n = seq_along(th), .combine = rbind, .packages = "data.table") %dopar% {
+      
+      Fit.th <- as.integer(Fit. >= th[n])
+      
+      # Bootstrapping using vectorized approach
+      Fit.prob <- mean(Fit.th)
+      Fit.n <- matrix(rbinom(rep * length(Fit.th), 1, Fit.prob), nrow = rep, byrow = TRUE)
+      
+      # Compute confusion matrices efficiently using matrix operations
+      tp_boot <- rowSums(Fit.n[, Obs. == 1] == 1)
+      fp_boot <- rowSums(Fit.n[, Obs. == 0] == 1)
+      fn_boot <- rowSums(Fit.n[, Obs. == 1] == 0)
+      tn_boot <- rowSums(Fit.n[, Obs. == 0] == 0)
+      
+      # Compute Jaccard similarity 
+      # jacc.sim_boot <- apply(Fit.n, 1, compute_jaccard, Obs.) 
+      jacc.sim_boot <- compute_jaccard_vectorized(Fit.n, Obs.) # faster
+      
+      # Return a combined data.table
+      data.table(
+        threshold = th[n],
+        tp = as.integer(tp_boot),  # Store summaries
+        fp = as.integer(fp_boot),
+        fn = as.integer(fn_boot),
+        tn = as.integer(tn_boot),
+        jaccard = jacc.sim_boot
+      )
+    }
+    
+    # Stop cluster
+    stopCluster(cl)
+    
+    res.n[, `:=` (
+      TPR = tp / (tp + fn),
+      TNR = tn / (tn + fp),
+      ACC = (tp + tn) / N,
+      TSS = tp / (tp + fn) + tn / (tn + fp) - 1
+    )]
+    res.n[is.na(TPR), TPR := 0]
+    res.n[is.na(TNR), TNR := 0]
+    res.n[is.na(ACC), ACC := 0]
+    res.n[is.na(TSS), TSS := 0]
+    
+    #compute_metrics(res.n)
+    
+    res.n[, test := "random"]
+    
+  } else {
+    res.n = NULL
+  }
+  
+  # get best threshold based on selected metric
+  THR <- get_best_threshold(metric)
+  
+  # Get final confusion matrix metrics
+  th.index <- which(th == THR$threshold)
+  A <- res.[th.index, tp]
+  B <- res.[th.index, fp]
+  C <- res.[th.index, fn]
+  D <- res.[th.index, tn]
+  
+  # Compute evaluation statistics
+  PPV <- ifelse(A + B > 0, A / (A + B), 0)
+  NPV <- ifelse(C + D > 0, D / (C + D), 0)
+  OR <- ifelse(C * B > 0, (A * D) / (C * B), 0)
+  JACC <- res.[th.index, jaccard]
+  ACC <- (A + D) / N
+  AUC <- tryCatch(as.numeric(suppressMessages(pROC::auc(Obs., Fit.))), error = function(e) NA)
+  TPR <- ifelse(A + C > 0, A / (A + C), 0)
+  TNR <- ifelse(B + D > 0, D / (B + D), 0)
+  TSS <- max(0, TPR + TNR - 1)
+  prA <- ACC
+  prE <- ((A + B) / N) * ((A + C) / N) + ((C + D) / N) * ((B + D) / N)
+  kappa <- (prA - prE) / (1 - prE)
+  
+  # Bootstrap confidence intervals for AUC
+  boot_function <- function(data, indices) {
+    Fit_sample <- Fit.[indices]
+    Obs_sample <- Obs.[indices]
+    suppressMessages(pROC::auc(Obs_sample, Fit_sample))
+  }
+  
+  boot_results <- suppressMessages(tryCatch(boot::boot(data = 1:length(Obs.), statistic = boot_function, R = 100), error = function(e) NA))  
+  auc_ci <- if (!inherits(boot_results, "boot")) c(NA, NA) else suppressMessages(boot::boot.ci(boot_results, type = "perc")$percent[4:5])
+  
+  tab <- data.table(
+    "Pearson" = cor,
+    "p.value" = p.cor,
+    "Jaccard" = JACC,
+    "TPR" = TPR,
+    "TNR" = TNR,
+    "TSS" = TSS,
+    "ACC" = ACC,
+    "AUC" = AUC,
+    "AUC_CI_lower" = auc_ci[1],
+    "AUC_CI_uppper" = auc_ci[2],
+    "kappa" = kappa,
+    "PPV" = PPV,
+    "NPV" = NPV,
+    "OR" = OR
+  )
+  
+  eval <- list(confusion = rbind(res., res.n), tab = tab, threshold = THR)
+  
+  if (plot) {
+    
+    ggplot2::ggplot(res.n, ggplot2::aes(x = TNR, y = TPR)) +
+      ggplot2::scale_y_continuous("sensitivity", limits = c(0,1), breaks = seq(0,1,0.25), expand = c(0.01,0.01)) +
+      ggplot2::scale_x_reverse("specificity", limits = c(1,0), breaks = seq(0,1,0.25), expand = c(0.01,0.01)) +
+      ggplot2::geom_tile(fill = "#132B42") +
+      ggplot2::stat_density_2d(aes(fill = ..level.., col = ..level..), geom = "polygon",
+                               alpha = 0.1, bins = 10) +
+      ggplot2::scale_color_gradient(low = "#132B42", high =  "#96B3C9") +
+      ggplot2::geom_path(data = res.[order(res.$TNR),], aes(x = TNR, y = TPR), col = "#E69F00", size = 1) +
+      ggplot2::geom_point(data = data.frame(x = TNR, y = TPR), aes_string(x = "x", y = "y"), col = "#E69F00", shape = 18, size = 4) +
+      ggplot2::annotate("text", x = TNR, y = TPR, label =  paste("italic(p)==", format.pval(THR$p.value)), parse = T, size = 4, hjust = -0.15, vjust = 1)+
+      ggplot2::theme_classic() +
+      ggplot2::coord_fixed() +
+      ggplot2::labs(title= gsub("\\s\\s", "\n", paste0(gsub('\\.', ' ', main), "  AUC=", round(AUC,2))), parse = T) +
+      ggplot2::theme(legend.position='none',
+                     panel.border=ggplot2::element_blank(),
+                     panel.grid.major=ggplot2::element_blank(),
+                     panel.grid.minor=ggplot2::element_blank(),
+                     title = ggplot2::element_text(color = "black", size = 10, vjust = 0.5, hjust = 0.5),
+                     axis.title.x = ggplot2::element_text(color = "black", size = 15, vjust = 0.5, hjust = 0.5),
+                     axis.title.y = ggplot2::element_text(color = "black", size = 15, vjust = 1, hjust = 0.5),
+                     axis.text.x = ggplot2::element_text(color = "black", size = 12),
+                     axis.text.y = ggplot2::element_text(color = "black", size = 12 ),
+                     axis.line = ggplot2::element_blank())
+    
+  }
+  
+  return(eval)
+}
+
+
+models_evaluation <- function(model, spsNames = NULL, th = NULL, ras = NULL, numCores = 1, 
+                              sample.pseudoabsences = TRUE, alpha = 0.5, transformation = "none", trans.param = 10, 
+                              plot = FALSE, rep = 100, best.th = c("ACC", "TSS", "jaccard")) {
+  
+  best.th <- best.th[1]  # Ensure only one best.th value is used
+  
+  # If Pred is a model object, extract necessary components
+  if (inherits(model, c("NINA", "ENmodel", "BCmodel", "ECmodel"))) {
+    
+    Obs <- model$obs
+    
+  } else {
+    stop("model not recognised.")
+  }
+  
+  res <- max(raster::res(raster_projection(model$env[,1:3])))
+  
+  # Define species names
+  spsNames <- if (is.null(spsNames)) { names(model$maps) } else { spsNames }
+  spsObs <- unique(Obs[, 3])
+  
+  # Check for missing species
+  missing.sps <- spsNames[!spsNames %in% spsObs]
+  if (length(missing.sps) > 0) {
+    warning("The following predicted species have no observations provided: ", paste(missing.sps, collapse = ", "))
+  }
+  
+  # Filter observations by species in predictions
+  Obs <- Obs[Obs[, 3] %in% spsNames, ]
+  
+  # Sample pseudo-absences if required
+  if (sample.pseudoabsences) {
+    message("Sampling pseudo_absences... ")
+    
+    # get per-species host availability maps
+    if (inherits(model, c("BCmodel", "ECmodel"))) {
+      w <- if (!is.null(model$clus)) reverse_list(model$w) else model$w
+      BioCons <- sapply(w, function(x) niche_to_dis(model$env, x, cluster = model$clus, cor = FALSE)[, 3])
+      BioCons[is.na(BioCons)] <- 0
+      BioCons <- cbind(model$env[, 1:2], BioCons)
+      ras <- raster_projection(BioCons)
+    }
+    
+    Abs.samp <- sample_pseudoabsences(Obs, model$env, spsNames = spsNames, ras = ras, 
+                                      alpha = alpha, transformation = transformation, trans.param = trans.param)
+    
+    Obs <- rbind(Abs.samp$Presences, Abs.samp$Absences)
+    occ.tab <- Abs.samp$tab
+  } else {
+    # Obs <- na.exclude(ecospat.sample.envar(dfsp = predictors, colspxy = 1:2, colspkept = 1:2, 
+    #                                        dfvar = Obs, colvarxy = 1:2, colvar = 3:4, resolution = res))
+    occ.tab <- table( as.factor(Obs[, 3]),Obs[,4])
+    colnames(occ.tab) <- c("n.absences", "n.occurrences")
+  }
+  
+  message("Performing models evaluation...")
+  
+  # Initialize output objects
+  n <- data.frame(matrix(NA, length(spsNames), 2), row.names = spsNames)
+  colnames(n) <- c("na", "np")
+  tab <- NULL
+  confusion <- NULL
+  threshold <- NULL
+  
+  # Extract predicted values for the coordinates in Obs
+  Pred. <- raster::extract(model$maps, Obs[, 1:2]) %>%
+    as.data.frame() %>%
+    mutate(x = Obs$x, y = Obs$y) %>%
+    pivot_longer(-c(x, y), names_to = "species", values_to = "Prob")
+  
+  # Merge predictions with Obs without creating duplicates
+  Pred. <- Obs %>%
+    left_join(Pred., by = c("x", "y", "species")) %>%
+    distinct()
+  
+  # Evaluate each species model
+  for (i in spsNames) {
+    message(paste("Evaluating", i, "niche model..."))
+    
+    Pred.sp <- Pred. %>%
+      filter(species == i)
+    
+    Obs. <- Pred.sp[, 4]
+    Fit. <- Pred.sp[, 5]
+    Fit.[is.na(Fit.)] <- 0
+    
+    n[i, ] <- as.vector(table(Obs.))
+    
+    eval <- evaluate_model(Fit., Obs., metric = best.th, rep = rep, th = th, main = i, plot = plot, numCores = numCores)
+    
+    tab <- rbind(tab, eval$tab, fill=TRUE)
+    confusion <- rbind(confusion, cbind(species = i, eval$confusion))
+    threshold <- rbind(threshold, data.frame(threshold = eval$threshold[1], p.value = eval$threshold[2]))
+  }
+  
+  tab <- as.data.frame(tab, row.names = spsNames)
+  threshold <- as.data.frame(threshold, row.names = spsNames)
+  
+  # Visualization
+  if (plot) {
+    z <- tab %>%
+      pivot_longer(
+        cols = c("Pearson", "Jaccard", "TPR", "TNR", 
+                 "TSS", "ACC", "AUC", "kappa", "PPV", "NPV"), 
+        names_to = "test", 
+        values_to = "value"
+      ) %>%
+      mutate(test = factor(test, levels = unique(test)))  
+    
+    p <- ggplot(z, aes(x = test, y = value, group = test)) +
+      geom_boxplot(fill = "#E69F00") +
+      ylim(0, 1) +
+      scale_x_discrete(labels = gsub("\\s", "\n", levels(z$test))) +
+      labs(title = "All models", x = "", y = "Score") +
+      theme_classic() +
+      theme(axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14),
+            axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12))
+    
+    print(p)
+  }
+  
+  out <- list(n = n, tab = tab, threshold = threshold, confusion = confusion, cases = occ.tab)
+  attr(out, "class") <- c("NINA", "eval")
+  message("Models evaluation complete.")
+  
+  return(out)
+}
+
+sample_pseudoabsences <- function(Obs, predictors, spsNames = NULL, alpha = 0.5, 
+                                  transformation = NULL, trans.param = 10,
+                                  ras = NULL, plot = FALSE) {
+  
+  
+  # If species names are not provided, extract unique species
+  if (is.null(spsNames)) {
+    spsNames <- unique(Obs[, 3])
+  }
+  
+  # Handle different predictor formats
+  if (inherits(predictors, c("data.frame", "matrix"))) {
+    pred.var <- colnames(predictors[, -c(1:2)])
+    pred.stack <- raster_projection(predictors)
+  } 
+  else if (inherits(predictors, c("RasterLayer", "RasterBrick", "RasterStack"))) {
+    pred.stack <- predictors
+    predictors <- na.omit(as.data.frame(pred.stack, xy = TRUE))
+    pred.var <- colnames(predictors[, -c(1:2)])
+  }
+  
+  res <- max(res(pred.stack))
+  
+  # perform PCA to create environmental space
+  pca_cal <- dudi.pca(predictors[, pred.var], center = TRUE, scale = TRUE, scannf = FALSE, nf = 2)
+  pca_scores <- cbind(predictors[,1:2], pca_cal$li)
+  
+  # Validate raster input
+  if (!is.null(ras)) {
+    if (!inherits(ras, c("RasterLayer", "RasterBrick", "RasterStack"))) {
+      stop("Argument 'ras' must be a raster object.")
+    }
+    if (!all(spsNames %in% names(ras))) {
+      stop("Argument 'ras' is missing some species found in 'Obs'.")
+    }
+  }
+  
+  # Initialize results
+  occ.P <- NULL
+  occ.A <- NULL
+  def <- data.frame(matrix(NA, nrow = length(spsNames), ncol = 3))
+  colnames(def) <- c("occ/pred", "n.occurrences", "n.absences")
+  rownames(def) <- spsNames
+  
+  # supporting function
+  # function to transform probabilities following a specific transformation function
+  transform_prob <- function(p, threshold, method = "sigmoid", param = 10) {
+    
+    if (method == "sigmoid") {
+      
+      return(p * (1 / (1 + exp(-param * (p - threshold)))))
+      
+    } else if (method == "exponential") {
+      
+      return(p * exp(param * (p - threshold)))
+      
+    } else if (method == "power") {
+      
+      return(p * (p / threshold)^param)
+      
+    } else { return(p) }
+  }
+  
+  # Loop through each species
+  for (sp in spsNames) {
+    
+    occ <- Obs[Obs$species == sp, 1:3]
+    
+    # Environmental sampling
+    occ.inn <- na.omit(ecospat.sample.envar(dfsp = pca_scores, colspxy = 1:2, colspkept = 1:4, 
+                                            dfvar = occ, colvarxy = 1:2, colvar = 3, resolution = res))
+    
+    n_occ <- nrow(occ.inn) # number of occurrences
+    
+    # Get matching indices from pca_scores
+    occ.inn_idx <- which(paste(pca_scores[,1], pca_scores[,2], sep = "_") 
+                         %in% 
+                           paste(occ.inn[,1], occ.inn[,2], sep = "_"))
+    
+    # Extract raster values if available
+    if (!is.null(ras)) {
+      P.ras <- raster::extract(ras[[sp]], predictors[, 1:2])
+      m.ras <- na.omit(cbind(predictors[, 1:2], P = P.ras))
+      ras.inn <- which(m.ras[, 3] > 0)
+      occ.inn_idx <- intersect(occ.inn_idx, ras.inn)
+    }
+    
+    # Compute Euclidean distances in geographical space
+    dist.geo <- apply(occ.inn, 1, function(i) sqrt((pca_scores[, 1] - as.numeric(i[1]))^2 + 
+                                                     (pca_scores[, 2] - as.numeric(i[2]))^2))
+    # Compute Euclidean distances in environmental space
+    dist.env <- apply(occ.inn, 1, function(i) sqrt((pca_scores[, 3] - as.numeric(i[3]))^2 + 
+                                                     (pca_scores[, 4] - as.numeric(i[4]))^2))
+    
+    # average distance across all occurrences
+    dist.pgeo <- rowMeans(dist.geo)
+    dist.penv <- rowMeans(dist.env)
+    
+    # get the average distance among occurrences
+    occ_avg_geodist <- mean(dist(occ.inn[,1:2]))
+    occ_avg_envdist <- mean(dist(occ.inn[,3:4]))
+    
+    # get indexes of locations environmentally and geographically closer than the mean among occurrences
+    close_locs_idx <- which(dist.pgeo < occ_avg_geodist & dist.penv < occ_avg_envdist)
+    
+    # Exclude occurrence locations
+    coords.out <- pca_scores[-occ.inn_idx, 1:2]
+    coords.inn <- pca_scores[, 1:4]
+    
+    # normalize to [0,1]
+    dist.pgeo <- dist.pgeo / max(dist.pgeo, na.rm = TRUE)
+    dist.penv <- dist.penv / max(dist.penv, na.rm = TRUE)
+    
+    # Average both distances
+    sampling_prob <- 1 - ((1 - dist.pgeo) ^ alpha) * ((1 - dist.penv) ^ (1 - alpha))
+    
+    # apply transformation (optional if method = "none") to increase difference from close and far env & geo locations
+    sampling_prob <- transform_prob(sampling_prob, threshold = 0.5, method = transformation, param = trans.param)
+    
+    # normalize to [0,1]
+    sampling_prob <- sampling_prob / max(sampling_prob, na.rm = TRUE) 
+    
+    # Exclude occurrences from sampling
+    sampling_prob[occ.inn_idx] = 0 
+    
+    # Compute number of pseudo-absences
+    number_absences <- round(n_occ / nrow(coords.inn) * nrow(coords.out), 0)
+    
+    # Apply min/max bounds to avoid extreme pseudo-absence numbers
+    min_absences <- 1 * n_occ # Ensure at least twice the occurrences
+    max_absences <- 10 * n_occ # Prevent excessive pseudo-absences
+    number_absences <- max(min_absences, min(max_absences, number_absences))
+    
+    # Sample pseudoabsences
+    pseudo_indices <- sample(1:nrow(pca_scores), size = number_absences, prob = sampling_prob, replace = FALSE)
+    
+    def[sp, 1] <- n_occ / nrow(pca_scores)
+    def[sp, 2] <- n_occ
+    def[sp, 3] <- number_absences
+    
+    # store occurrences matching geographical coordinates
+    occ.P <- rbind(occ.P, cbind(occ.inn[, 1:2], species = sp, PA = 1))
+    # store sampled pseudo-absences
+    occ.A <- rbind(occ.A, cbind(pca_scores[pseudo_indices, 1:2], species = sp, PA = 0))
+    
+    if (plot) {
+      
+      par(mfrow = c(1,2))
+      plot(raster_projection(cbind(pca_scores[, 1:2], sampling_prob)))
+      points(occ.inn[,1:2], pch = 4, cex = 1, col = "#0000FF80")
+      points(pca_scores[pseudo_indices,1:2], pch = 19, cex = 0.5, col = "#FF000080")
+      
+      plot(raster_projection(cbind(pca_scores[, 3:4], sampling_prob)))
+      points(occ.inn[,3:4], pch = 4, cex = 1, col = "#0000FF80")
+      points(pca_scores[pseudo_indices,3:4], pch = 19, cex = 0.5, col = "#FF000080")
+      par(mfrow = c(1,1))
+      
+    }
+  }
+  
+  # Store results
+  out <- list(
+    Presences = occ.P,
+    Absences = occ.A,
+    tab = def
+  )
+  
+  return(out)
+}
+
+save_model <- function(m, path = "~", project.name = "NINA1") {
+  
+  # Ensure the model is of class "NINA"
+  if (!inherits(m, "NINA")) {
+    stop("Object is not of class NINA")
+  }
+  
+  # Set main directory path
+  path <- file.path(path, project.name)
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+  
+  # If it's a list of models, recursively save them
+  if (inherits(m, "modelsList")) {
+    lapply(names(m), function(l) save_model(m[[l]], path = path, project.name = l))
+    write.table(class(m), file = file.path(path, "class.txt"), row.names = FALSE, col.names = FALSE)
+    return()
+  }
+  
+  # If it's an individual model (ENmodel, BCmodel, ECmodel)
+  if (!inherits(m, c("ENmodel", "BCmodel", "ECmodel"))) {
+    stop("Unsupported model class")
+  }
+  
+  # Save class information
+  write.table(class(m), file = file.path(path, "class.txt"), row.names = FALSE, col.names = FALSE)
+  
+  # Define a helper function to write niche models
+  save_niche_models <- function(models, subfolder) {
+    if (!is.null(models)) {
+      npath <- file.path(path, subfolder)
+      if (!dir.exists(npath)) dir.create(npath)
+      lapply(names(models), function(r) {
+        obj <- models[[r]]
+        if (inherits(obj, c("NINA", "niche"))) {
+          write_niche(obj, path = npath, file = gsub("\\/", " ", r))
+        } else if (is.list(obj)) {
+          sub_npath <- file.path(npath, gsub("\\/", " ", r))
+          if (!dir.exists(sub_npath)) dir.create(sub_npath)
+          lapply(names(obj), function(s) {
+            if (inherits(obj[[s]], c("NINA", "niche"))) {
+              write_niche(obj[[s]], path = sub_npath, file = s)
+            }
+          })
+        }
+      })
+    }
+  }
+  
+  # Save niche models
+  save_niche_models(m$z.mod, "z")
+  save_niche_models(m$z.mod.global, "zglobal")
+  save_niche_models(m$w, "w")
+  
+  # Save species distributions
+  npath <- file.path(path, "sd")
+  if (!dir.exists(npath)) dir.create(npath)
+  write.table(m$pred.dis, file = file.path(npath, "species_distributions.txt"))
+  lapply(names(m$maps), function(s) {
+    writeRaster(m$maps[[s]], filename = file.path(npath, paste0(gsub("\\.", "_", s), ".tif")),
+                format = "GTiff", overwrite = TRUE)
+  })
+  
+  # Save general model info
+  npath <- file.path(path, "info")
+  if (!dir.exists(npath)) dir.create(npath)
+  write.table(m$tab, file = file.path(npath, "tab.txt"))
+  if (!is.null(m$fail)) write.table(m$fail, file = file.path(npath, "fail.txt"))
+  write.table(m$predictors, file = file.path(npath, "predictors.txt"), row.names = FALSE, col.names = FALSE)
+  write.table(as.character(m$crs), file = file.path(npath, "crs.txt"))
+  
+  # Save additional model data
+  npath <- file.path(path, "data")
+  if (!dir.exists(npath)) dir.create(npath)
+  if (!is.null(m$clus)) write.table(m$clus, file = file.path(npath, "regions.txt"))
+  if (is.data.frame(m$obs)) {
+    write.table(m$obs, file = file.path(npath, "occurrences.txt"))
+  } else {
+    write.table(do.call(rbind, m$obs), file = file.path(npath, "occurrences.txt"))
+  }
+  write.table(m$sp.scores, file = file.path(npath, "sp_scores.txt"))
+  write.table(m$env.scores, file = file.path(npath, "env_scores.txt"))
+  saveRDS(m$pca, file = file.path(npath, "pca.RDS"))
+  
+  # Save evaluation results
+  if (!is.null(m$eval)) {
+    npath <- file.path(path, "eval")
+    if (!dir.exists(npath)) dir.create(npath)
+    lapply(names(m$eval), function(n) {
+      write.table(m$eval[[n]], file = file.path(npath, paste0(n, ".txt")))
+    })
+  }
+}
+
+# Function to estimate the niche of a given species
+estimate_niche <- function (glob, glob1, sp, R, h = "href", mask = NULL, th.o = NULL, 
+                            th.s = NULL, method = c("epa", "bivnorm")) {
+  
+  method <- match.arg(method)
+  glob <- as.matrix(glob)
+  glob1 <- as.matrix(glob1)
+  sp <- as.matrix(sp)
+  
+  l <- list()
+  if (any(sapply(list(glob, glob1, sp), ncol) > 2)) {
+    warning("coordinates matrix have more than 2 dimensions...only the first 2 will be used!")
+  }
+  else if (any(sapply(list(glob, glob1, sp), ncol) > 2)) {
+    stop("2 dimensional matrix required")
+  }
+  else {
+    ext <- c(range(glob[, 1]), range(glob[, 2]))
+    glob1.dens <- kernel_density_grid(glob1, R = R, h = h, 
+                                      method = method, th = th.s, env.mask = mask, ext = ext)
+    sp.dens <- kernel_density_grid(sp, R = R, h = h, method = method, 
+                                   th = th.o, env.mask = mask, ext = ext)
+    l$x <- seq(from = ext[1], to = ext[2], length.out = R)
+    l$y <- seq(from = ext[3], to = ext[4], length.out = R)
+    l$glob <- glob
+    l$glob1 <- glob1
+    l$sp <- sp
+    l$z <- sp.dens * nrow(sp)/raster::cellStats(sp.dens, 
+                                                "sum")
+    l$Z <- glob1.dens * nrow(glob1)/raster::cellStats(glob1.dens, 
+                                                      "sum")
+    l$z[l$Z == 0] = 0
+    l$z.uncor <- l$z/raster::cellStats(l$z, "max")
+    l$z.cor <- l$z/l$Z
+    l$z.cor[is.na(l$z.cor)] <- 0
+    l$z.cor <- l$z.cor/raster::cellStats(l$z.cor, "max")
+    l$w <- l$z.uncor
+    l$w[l$w > 0] <- 1
+  }
+  
+  attr(l, "class") <- "niche"
+  
+  return(l)
+}
+
+
+ENmodel <- function(occ, env, clus = NULL, R = 100, cor = FALSE, extrapolate = FALSE, extrapolateIf = FALSE, FORCE = FALSE,
+                    type.pred = c("probability", "abundance", "density"), crs = 4326, res = NULL,
+                    eval = FALSE) {
+  
+  message("Initializing data...")
+  occ_prep <- preprocess_occurrences(occ)
+  occ_data <- occ_prep$occ
+  valid_species <- occ_prep$valid_species
+  
+  message("Performing PCA on environmental space...")
+  env.var <- colnames(env)[-c(1:2)]
+  pca.cal <- dudi.pca(stats::na.exclude(env[, env.var]), center = TRUE, scale = TRUE, scannf = FALSE, nf = 2)
+  
+  message("Sampling environmental space...")
+  env_scores <- cbind(env[, 1:2], pca.cal$li)
+  sp_scores <- postprocess_occurrences(occ_data, env_scores, res = res)
+  
+  # initialize objects
+  z.mod <- list()
+  pred.dis <- data.frame()
+  
+  if (is.null(clus)) {
+    
+    env_scores$region = "global"
+    sp_scores$region = "global"
+    regions <- "global"
+    regcol <- "region"
+    
+  } else{
+    
+    # add regions
+    env_scores <- merge(env_scores, clus, by  = c("x", "y"))
+    sp_scores <- merge(sp_scores, clus, by  = c("x", "y"))
+    
+    # regions set
+    regions <- unique(clus[,3])
+    # regions column name
+    regcol <- colnames(clus)[3]
+  }
+  
+  message("Starting niche estimation...")
+  # iterate through regions
+  for (region in regions) {
+    message("...in ", region)
+    
+    species <- unique(sp_scores$species[sp_scores[[regcol]] == region])
+    
+    # get environmental scores
+    env_glob <- env_scores %>%
+      dplyr::filter(.data[[regcol]] == region) %>%
+      dplyr::select(Axis1, Axis2)
+    
+    Axis1_range <- range(env_glob$Axis1)
+    Axis2_range <- range(env_glob$Axis2)
+    
+    niche_reglist <- NULL
+    if (nrow(env_glob) > 4) {
+      
+      niche_reglist <- sapply(species, function(sp) {
+        
+        # get species scores
+        if (extrapolate) {
+          
+          # add environmental scores from the full geographic range
+          sp_glob <- sp_scores %>%
+            dplyr::filter(species == sp,
+                          Axis1 >= Axis1_range[1], Axis1 <= Axis1_range[2],  
+                          Axis2 >= Axis2_range[1], Axis2 <= Axis2_range[2]) %>%
+            dplyr::select(Axis1, Axis2)
+          
+        } else {
+          
+          # add scores relative to the environmental region only
+          sp_glob <- sp_scores %>%
+            dplyr::filter(.data[[regcol]] == region & species == sp) %>%
+            dplyr::select(Axis1, Axis2)
+          
+          if (nrow(sp_glob) < 4 & extrapolateIf){
+            
+            # add environmental scores from the full geographic range
+            sp_glob <- sp_scores %>%
+              dplyr::filter(species == sp,
+                            Axis1 >= Axis1_range[1], Axis1 <= Axis1_range[2],  
+                            Axis2 >= Axis2_range[1], Axis2 <= Axis2_range[2]) %>%
+              dplyr::select(Axis1, Axis2)
+            
+          }
+        }
+        # estimate niche
+        if (nrow(sp_glob) > 4){
+          estimate_niche(env_glob, env_glob, sp_glob, R)
+        }
+        # force in cases like A. mccullochi where only inhabits less than 4 locations at the study scale
+        else if (nrow(sp_glob) > 2 & FORCE){
+          # duplicate scores to allow computation
+          z <- estimate_niche(env_glob, env_glob, rbind(sp_glob, sp_glob), R)
+          z$sp <- sp_glob
+          z$z <- z$z / 2
+          z$z.cor <- z$z / z$Z
+          z
+        }
+      }, simplify = FALSE)
+      
+      # drop NULL elements
+      niche_reglist <- niche_reglist[!sapply(niche_reglist, is.null)]
+      
+    } 
+    # failed species
+    failed_species <- species[!species %in% names(niche_reglist)]
+    if (length(failed_species) > 0) {
+      message("The following species failed: ", paste(failed_species, collapse = ", "))
+    }
+    
+    # get environmental coordinates
+    env_coords <- env_scores %>%
+      dplyr::filter(.data[[regcol]] == region) %>%
+      dplyr::select(x, y)
+    
+    # get projected distributions of environmental niches
+    distributions <- cbind(env_coords, sapply(unique(sp_scores$species), function(sp) {
+      
+      if (sp %in% names(niche_reglist)) {
+        # extract niche densities from env space
+        raster::extract(niche_reglist[[sp]]$z, 
+                        niche_reglist[[sp]]$glob)
+      } else {
+        0
+      }
+    }, simplify = FALSE))
+    
+    z.mod[[region]] <- niche_reglist
+    pred.dis <- rbind(pred.dis, distributions)
+  }
+  
+  if (type.pred == "probability") {
+    # Normalize each species' density occurrence by its maximum value
+    pred.dis[, -c(1:2)] <- sweep(pred.dis[, -c(1:2)], 2, apply(pred.dis[, -c(1:2)], 2, max, na.rm = TRUE), `/`)
+  }
+  
+  if (type.pred == "abundance") {
+    # Normalize each species' density occurrence by the overall maximum density occurrence
+    pred.dis[, -c(1:2)] <- pred.dis[, -c(1:2)] / max(pred.dis[, -c(1:2)], na.rm = TRUE)
+  }
+  
+  # generate rasters
+  ras_dis <- raster_projection(pred.dis, crs = crs)
+  
+  # create a species / regions table
+  regions <- rep(names(z.mod), lengths(z.mod))
+  species <- unlist(lapply(z.mod, names))
+  tab <- table(species, regions)
+  
+  model <- list(
+    # result
+    pred.dis = pred.dis,
+    z.mod = z.mod,
+    maps = ras_dis,
+    # PCA info
+    pca = pca.cal,
+    sp.scores = sp_scores,
+    env.scores = env_scores,
+    # input data
+    obs = sp_scores %>% dplyr::select(x, y, species), # obs with matching coords
+    env = env,
+    clus = clus,
+    # extra info
+    predictors = env.var,
+    crs = crs,
+    tab = tab
+  )
+  
+  attr(model, "class") <- c("NINA", "ENmodel")
+  
+  if (eval == TRUE) {
+    message("Carrying out models evaluations...")
+    model$eval <- models_evaluation(model, ras = NULL, sample.pseudoabsences = TRUE, 
+                                    alpha = 0.5, transformation = "none", trans.param = 10, 
+                                    plot = FALSE, rep = 100, th = NULL,  best.th = "accuracy")
+  }
+  
+  message("Completed.")
+  return(model)
+}
+
+check_Amatrix <- function(M, sps1, sps2) {
+  
+  all(sps1 %in% rownames(M)) & all(sps2 %in% colnames(M))
+  
+}
+
+estimate_betas <- function(y.list, C.matrix = NULL, cor = FALSE, K = NULL) {
+  
+  # If no C.matrix is provided, create an identity-based interaction matrix
+  if (is.null(C.matrix)) {
+    C.matrix <- 1 - diag(length(y.list))
+    dimnames(C.matrix) <- list(names(y.list), names(y.list))
+  }
+  
+  # Choose whether to use corrected ("z.cor") or uncorrected ("z.uncor") species presence values
+  z_type <- if (cor) "z.cor" else "z.uncor"
+  
+  # If K is not provided, calculate the total species presence across all locations
+  if (is.null(K)) {
+    K <- sum(stack(sapply(names(y.list), function(i) y.list[[i]][[z_type]])))
+  }
+  
+  # Initialize betas list, iterating over species names
+  betas <- sapply(names(y.list), function(n) {
+    
+    # Get the species presence raster for the current species
+    z <- y.list[[n]][[z_type]]
+    
+    # Compute the sum of co-occurrences based on interaction matrix C
+    sum.co <- sum(stack(sapply(names(y.list), function(i) C.matrix[n, i] * y.list[[i]][[z_type]])))
+    
+    # Adjust species presence by removing co-occurrence effect
+    z * (1 - sum.co / K)
+  })
+  
+  # Remove any rasters where the maximum presence value is 0 (no presence)
+  betas <- Filter(function(i) raster::maxValue(i) > 0, betas)
+  
+  return(betas)
+}
+
+estimate_w <- function(y.list, id, A.matrix = NULL, 
+                       cor = F, K = NULL, method = c("composition", "densities"), 
+                       C.matrix = NULL){
+  
+  method = method[1]
+  
+  if (is.null(A.matrix)) {
+    A.matrix = matrix(1, nrow = 1, ncol = length(y.list), 
+                      byrow = TRUE, dimnames = list(id, names(y.list)))
+    
+  }
+  
+  w <- NULL
+  if (method == "composition") {
+    
+    # compute competition among hosts
+    betas <- estimate_betas(y.list, C.matrix = C.matrix, 
+                            cor = cor, K = K)
+    
+    # get specific associations
+    Xvar = colnames(A.matrix)[A.matrix[id, ] != 0]
+    # match those existing in y.list
+    Xvar <- Xvar[Xvar %in% names(y.list)]
+    
+    if (length(Xvar) > 0) {
+      
+      # Initialize w
+      w <- y.list[[Xvar[1]]]
+      
+      if (cor) {
+        if (length(Xvar) == 1) {
+          w$sp <- y.list[[Xvar]]$sp
+          # weight occ density by beta
+          w$z.cor = betas[[Xvar]] * A.matrix[id, Xvar] 
+          w$z.cor[is.na(w$z.cor)] <- 0
+        }
+        else {
+          w$sp <- do.call(rbind, lapply(y.list[Xvar], 
+                                        function(i) as.matrix(i$sp)))
+          w$z = sum(stack(lapply(y.list[Xvar], function(i) i$z)), 
+                    na.rm = T)
+          # weight occ density by beta
+          w$z.cor = sum(stack(lapply(names(y.list), function(i) betas[[i]] * 
+                                       as.numeric(A.matrix[id, i]))), na.rm = T)
+          w$z.cor[is.na(w$z.cor)] <- 0
+        }
+        w$z <- w$z.cor * w$Z
+        w$z.uncor <- w$z/raster::cellStats(w$z, "max")
+        w$z.uncor[is.na(w$z.uncor)] <- 0
+        w$w <- w$z.uncor
+        w$w[w$w > 0] <- 1
+        w$z.cor <- w$z.cor/raster::cellStats(w$z.cor, 
+                                             "max")
+      }
+      else {
+        if (length(Xvar) == 1) {
+          w$sp <- y.list[[Xvar]]$sp
+          # weight occ density by beta
+          w$z.uncor = betas[[Xvar]] * as.numeric(A.matrix[id, Xvar])
+        }
+        else {
+          w$sp <- do.call(rbind, lapply(y.list[Xvar], 
+                                        function(i) as.matrix(i$sp)))
+          w$z = sum(stack(lapply(y.list[Xvar], function(i) i$z)),  na.rm = T)
+          # weight occ density by beta
+          w$z.uncor = sum(stack(lapply(names(y.list),  function(i) 
+            betas[[i]] * as.numeric(A.matrix[id, i]))), na.rm = T)
+        }
+        w$z = w$z.uncor * cellStats(w$z, "max")
+        w$z.uncor[is.na(w$z.uncor)] <- 0
+        w$w <- w$z.uncor
+        w$w[w$w > 0] <- 1
+        w$z.cor <- w$z/w$Z
+        w$z.cor[is.na(w$z.cor)] <- 0
+        w$z.cor <- w$z.cor/raster::cellStats(w$z.cor, 
+                                             "max")
+      }
+      w$betas <- stack(betas)
+      w$alpha <- length(betas[Xvar])/length(y.list)
+    }
+  }
+  if (method == "densities") {
+    # positive interactions only
+    Pvar = intersect(colnames(A.matrix)[A.matrix[id, ] > 0], names(y.list))
+    
+    if (length(Pvar) > 0) {
+      if (cor) {
+        betas <- sapply(Pvar, function(i) y.list[[i]]$z.cor * as.numeric(A.matrix[id, i]))
+      }
+      else {
+        betas <- sapply(Pvar, function(i)  y.list[[i]]$z.uncor * as.numeric(A.matrix[id, i]))
+      }
+      
+      # compute probability of at least one occurrence
+      PPA <- 1
+      for (i in Pvar) {
+        betas[[i]][is.na(betas[[i]])] = 0
+        PPA <- (1 - betas[[i]]) * PPA
+      }
+      PPP <- 1 - PPA
+      
+      # Initialize w
+      w <- y.list[[Pvar[1]]]
+      
+      # add sp scores (glob scores are the same for all)
+      if (length(Pvar) == 1) {
+        w$sp <- y.list[[Pvar]]$sp
+      }
+      else {
+        w$sp <- do.call(rbind, 
+                        lapply(y.list[Pvar], function(i) as.matrix(i$sp)))
+      }
+      
+      if (cor) {
+        w$z <- PPP * w$Z
+        w$z.uncor <- w$z/raster::cellStats(w$z, "max")
+        w$z.uncor[is.na(w$z.uncor)] <- 0
+        w$z.cor <- PPP
+        w$z.cor[is.na(w$z.cor)] <- 0
+        w$w <- w$z.cor
+        w$w[w$w > 0] <- 1
+      }
+      else {
+        w$z <- PPP * raster::cellStats(sum(raster::stack(sapply(y.list[Pvar], 
+                                                                function(i) i$z))), "max")
+        w$z.cor <- w$z/w$Z
+        w$z.cor[is.na(w$z.cor)] <- 0
+        w$z.cor <- w$z.cor/raster::cellStats(w$z.cor, "max")
+        w$z.uncor <- PPP
+        w$z.uncor[is.na(w$z.uncor)] <- 0
+        w$w <- w$z.uncor
+        w$w[w$w > 0] <- 1
+      }
+      w$betas <- betas
+      w$alpha <- length(Pvar)/length(y.list)
+    }
+    # Not implemented yet
+    if (FALSE) {
+      Nvar = colnames(A.matrix)[A.matrix[id, ] < 0]
+      Nvar <- Nvar[Nvar %in% names(y.list)]
+      if (length(Nvar) > 0) {
+        PNA <- 1
+        for (i in Nvar) PNA <- (1 - betas[[i]] * A.matrix[id, 
+                                                          i]) * PNA
+        PNP <- 1 - PNA
+        Nw <- sapply(Nvar, function(i) betas[[i]] * A.matrix[id, 
+                                                             i])
+        r <- raster::cellStats(PNP, "max")/sum(stack(Nw))
+        Nw <- stack(Nw) * r
+        Nz <- y.list[[Nvar[1]]]
+        Nz$sp <- do.call(rbind, lapply(y.list[Nvar], 
+                                       function(i) as.matrix(i$sp)))
+        Nz$Z <- sum(stack(sapply(y.list[Nvar], function(i) i$Z)))
+        Nz$z <- PPP * Nz$Z
+        Nz$z.uncor <- Nz$z/raster::cellStats(Nz$z, "max")
+        Nz$z.uncor[is.na(Nz$z.uncor)] <- 0
+        Nz$w <- Nz$z.uncor
+        Nz$w[Nz$w > 0] <- 1
+        Nz$z.cor <- Nz$z/Nz$Z
+        Nz$z.cor[is.na(Nz$z.cor)] <- 0
+        Nz$z.cor <- Nz$z.cor/cellStats(Nz$z.cor, "max")
+        Nz$PNP <- PNP
+        Nz$betas <- Nw
+        Nz$alpha <- length(Pvar)/length(y.list)
+      }
+    }
+  }
+  
+  class(w) <- c("NINA", "niche")
+  
+  return(w)
+}
+
+refine_niche <- function(z, y.list, id, D = 1, A.matrix = NULL,
+                         method = c("composition", "densities"),
+                         cor = F,  K  = NULL, C.matrix = NULL ){
+  
+  method <- method[1]
+  
+  # Select the target variable based on 'cor' flag
+  target_var <- if (cor) "z.cor" else "z.uncor"
+  
+  # Check association matrix
+  if (is.null(A.matrix) | !check_Amatrix(A.matrix, id, names(y.list))) {
+    stop("Association matrix incorrect or not provided.")
+  }
+  
+  # get species associations
+  Xvar = intersect(names(y.list), colnames(A.matrix)[A.matrix[id, ]  != 0])
+  
+  if(length(Xvar) > 0){
+    # estimate host availability
+    w <- estimate_w(y.list, id = id, A.matrix = A.matrix, cor = cor,
+                    K = K, method = method, C.matrix = C.matrix)
+    # get raster weighting coefficients
+    wc <- if (!is.null(w)) w[[target_var]] else 0 
+    
+  } else {
+    w = NULL
+    wc = 0
+  }
+  
+  # Apply correction to the chosen variable
+  if (method == "composition") {
+    z[[target_var]] <- z[[target_var]] * (1 - D * (1 - wc))
+  } else if (method == "densities" && D > 0) {
+    z[[target_var]] <- z[[target_var]] * wc / D
+  }
+  
+  # Ensure the corrected variable remains normalized between 0 and 1
+  z[[target_var]] <- z[[target_var]] / raster::cellStats(z[[target_var]], "max")
+  z[[target_var]][is.na(z[[target_var]])] <- 0
+  
+  # Convert back to occurrence density
+  if (cor) {
+    z$z <- z$z.cor * raster::cellStats(z$z / z$Z, "max") * z$Z
+    # Compute alternative target
+    z$z.uncor <- z$z / z$Z
+    z$z.uncor[is.na(z$z.uncor)] <- 0
+    z$z.uncor <- z$z.uncor / raster::cellStats(z$z.uncor, "max")
+    
+  } else {
+    z$z <- z$z.uncor * raster::cellStats(z$z, "max")
+    # Compute alternative target
+    z$z.cor <- z$z / z$Z
+    z$z.cor[is.na(z$z.cor)] <- 0
+    z$z.cor <- z$z.cor / raster::cellStats(z$z.cor, "max")
+  }
+  z$w <- z[[target_var]]
+  z$w[z$w > 0] <- 1
+  
+  # Assign class
+  class(z) <- c("NINA", "niche")
+  
+  out = list(w = w, z = z)
+  
+  return(out)
+}
+
+BCmodel <- function (x, y, A.matrix = NULL, relative.niche = FALSE, type.pred = c("probability", "abundance", "density"),
+                     C.matrix = NULL, D = 1, K = NULL, method = c("composition", "densities"), 
+                     eval = TRUE, cor = FALSE) {
+  
+  method = method[1]
+  
+  if (!inherits(x, c("NINA", "ENmodel"))) {
+    stop("Argument 'x' is not a NINA Environmental model")
+  }
+  if (!inherits(y, c("NINA", "ENmodel"))) {
+    stop("Argument 'y' is not a NINA Environmental model")
+  }
+  
+  clus = F
+  if (!identical(x$clus, y$clus)) {
+    stop("Model x and model y have been estimated in different scales")
+  }
+  if (inherits(x$clus, "data.frame")) {
+    clus = T
+  }
+  
+  xnames <- names(x$maps)
+  ynames <- names(y$maps)
+  
+  x.mod = x$z.mod
+  y.mod = y$z.mod
+  
+  # Initialize objects
+  z.mod = list()
+  w.mod = list()
+  pred.dis <- data.frame()
+  
+  if (is.null(clus)) {
+    
+    env_scores <- cbind(x$env.scores, region = "global")
+    regions <- "global"
+    
+  } else {
+    
+    env_scores = x$env.scores
+    regions <- names(x.mod)
+    
+  }
+  
+  ## Check A.matrix
+  if (inherits(A.matrix, "list")) {
+    
+    A.matrixList <- A.matrix
+    missing_regions <- !names(x.mod) %in% names(A.matrixList)
+    
+    if (any(missing_regions)) {
+      x.mod <- x.mod[names(A.matrixList)]
+      if (length(x.mod) == 0) stop("Names on A.matrix list do not correspond to region names.")
+      warning("Some regions from models are missing in A.matrix list. Only provided regions will be estimated.")
+    }
+    
+    reg_x_int_match <- sapply(names(x.mod), function(r) 
+      any(!names(x.mod[[r]]) %in% rownames(A.matrixList[[r]])))
+    reg_y_int_match <- sapply(names(y.mod), function(r) 
+      any(!names(y.mod[[r]]) %in% colnames(A.matrixList[[r]])))
+    
+    if (any(reg_x_int_match)) {
+      x.mod <- lapply(names(x.mod), function(r) x.mod[[r]][names(x.mod[[r]]) %in% rownames(A.matrixList[[r]])])
+      if (all(lengths(x.mod) == 0)) stop("Species in model 'x' are not present in 'A.matrix'.")
+    }
+    
+    if (any(reg_y_int_match)) {
+      y.mod <- lapply(names(y.mod), function(r) y.mod[[r]][names(y.mod[[r]]) %in% colnames(A.matrixList[[r]])])
+      if (all(lengths(y.mod) == 0)) stop("Species in model 'y' are not present in 'A.matrix'.")
+    }
+  }
+  else if (inherits(A.matrix, c("data.frame", "matrix"))) {
+    if (!all(xnames %in% rownames(A.matrix))) {
+      stop("Some species in model 'x' are missing from 'A.matrix'.")
+    }
+    if (!all(colnames(A.matrix) %in% ynames)) {
+      stop("Some species in model 'y' are missing from 'A.matrix'.")
+    }
+    if (clus) {
+      warning("Only one interaction matrix provided as 'data.frame'. Assuming same interaction matrix for all regions.")
+    }
+    A.matrixList <- setNames(rep(list(A.matrix), length(x$z.mod)), regions)
+  } 
+  else { stop("'A.matrix' must be a 'data.frame' or 'list'.") }
+  
+  message("Starting niche correction...")
+  for (region in regions) {
+    message("...in ", region)
+    
+    species <- names(x.mod[[region]])
+    
+    niche_reglist <- sapply(species, function(sp) {
+      message("Correcting ", sp, "...")
+      
+      z = x.mod[[region]][[sp]]
+      bc <- refine_niche(z, y.mod[[region]], id = sp, D = D, K = K, 
+                         A.matrix = A.matrixList[[region]], 
+                         method = method, cor = cor, C.matrix = C.matrix)
+      
+    }, simplify = FALSE)
+    
+    w_reglist <- sapply(niche_reglist, function(i) i$w, simplify = FALSE)
+    niche_reglist <- sapply(niche_reglist, function(i) i$z, simplify = FALSE)
+    
+    # drop NULL elements
+    w_reglist <- w_reglist[!sapply(niche_reglist, is.null)]
+    niche_reglist <- niche_reglist[!sapply(niche_reglist, is.null)]
+    
+    # failed species
+    failed_species <- species[!species %in% names(niche_reglist)]
+    if (length(failed_species) > 0) {
+      message("The following species failed: ", paste(failed_species, collapse = ", "))
+    }
+    
+    # get environmental coordinates
+    env_coords <- env_scores %>%
+      dplyr::filter(.[[5]] == region) %>%
+      dplyr::select(x, y)
+    
+    # get projected distributions of environmental niches
+    distributions <- cbind(env_coords, sapply(xnames, function(sp) {
+      
+      if (sp %in% names(niche_reglist)) {
+        # extract niche densities from env space
+        raster::extract(niche_reglist[[sp]]$z, 
+                        niche_reglist[[sp]]$glob)
+      } else {
+        0
+      }
+    }, simplify = FALSE))
+    
+    z.mod[[region]] <- niche_reglist
+    w.mod[[region]] <- w_reglist
+    pred.dis <- rbind(pred.dis, distributions)
+    
+  }
+  
+  if (type.pred == "probability") {
+    # Normalize each species' density occurrence by its maximum value
+    pred.dis[, -c(1:2)] <- sweep(pred.dis[, -c(1:2)], 2, apply(pred.dis[, -c(1:2)], 2, max, na.rm = TRUE), `/`)
+  }
+  
+  if (type.pred == "abundance") {
+    # Normalize each species' density occurrence by the overall maximum density occurrence
+    pred.dis[, -c(1:2)] <- pred.dis[, -c(1:2)] / max(pred.dis[, -c(1:2)], na.rm = TRUE)
+  }
+  
+  # generate raster maps
+  ras_dis <- raster_projection(pred.dis, crs = crs)
+  
+  # create a species / regions table
+  regions <- rep(names(z.mod), lengths(z.mod))
+  species <- unlist(lapply(z.mod, names))
+  tab <- table(species, regions)
+  
+  model <- list(
+    # result
+    pred.dis = pred.dis,
+    z.mod = z.mod,
+    w.mod = w.mod,
+    maps = ras_dis,
+    # PCA info
+    pca = x$pca,
+    sp.scores = x$sp.scores,
+    env.scores = x$env.scores,
+    # input data
+    obs = x$obs, 
+    env = x$env,
+    clus = x$clus,
+    # extra info
+    predictors = x$predictors,
+    crs = x$crs,
+    tab = tab
+  )
+  
+  attr(model, "class") <- c("NINA", "BCmodel")
+  
+  if (eval == TRUE) {
+    message("Carrying out models evaluations...")
+    model$eval <- models_evaluation(model, sample.pseudoabsences = TRUE, 
+                                    alpha = 0.5, transformation = "none", trans.param = 10, 
+                                    plot = FALSE, rep = 100, th = NULL,  best.th = "accuracy")
+  }
+  
+  message("Completed.")
+  return(model)
+  
+}
