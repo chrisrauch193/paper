@@ -1,0 +1,5 @@
+source("~/a0236995/paper/scripts/0c_marine_regions.R", echo = TRUE)
+source("~/a0236995/paper/scripts/0b_env_datapreparation.R", echo = TRUE)
+source("~/a0236995/paper/scripts/0d_env_var_selection.R", echo = TRUE)
+source("~/a0236995/paper/scripts/0a_occ_datapreparation.R", echo = TRUE)
+source("~/a0236995/paper/scripts/99_compare_outputs.R", echo = TRUE)
