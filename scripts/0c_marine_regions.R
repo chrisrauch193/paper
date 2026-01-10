@@ -1,12 +1,12 @@
 # scripts/0c_marine_regions.R
 # ------------------------------------------------------------------------------
-# STEP 1: PREPARE MARINE REGIONS (Robust Name-Based Selection)
+# STEP 1: PREPARE MARINE REGIONS (Hard-Coded Lists)
 # ------------------------------------------------------------------------------
 
 # !!! MASTER SWITCH !!!
-# "REPLICATION" = Tropical Indo-Pacific Only (Paper Guy's Scope)
-# "EXPANSION"   = Tropical + Warm Temperate Expansion Zones (Thesis Scope)
-PIPELINE_MODE <- "EXPANSION" 
+# "REPLICATION" = Matches Paper Guy (Tropical + Specific Temperate)
+# "EXPANSION"   = Thesis Scope (Tropical + Wider Expansion Zones)
+PIPELINE_MODE <- "REPLICATION" 
 
 if(!require("pacman")) install.packages("pacman")
 pacman::p_load(sf, dplyr, readr, terra)
@@ -23,38 +23,44 @@ cat("--- RUNNING IN", PIPELINE_MODE, "MODE ---\n")
 cat("Loading MEOW Shapefile...\n")
 regions <- st_read(MEOW_SHP, quiet = TRUE)
 
-# --- 2. DEFINE REGIONS BASED ON MODE ---
+# --- 2. DEFINE REGIONS (Hard-Coded Raw Names) ---
+# Note: These names match the raw shapefile BEFORE any underscores are added.
 
 if (PIPELINE_MODE == "REPLICATION") {
-  # --- PAPER GUY'S EXACT SCOPE ---
-  # We select the Tropical Realms by NAME to avoid ID mismatches.
-  # This covers his "18:41, 58, 55, 9" range accurately.
-  cat("Selecting Tropical Core (Paper Guy's Scope)...\n")
+  cat("Selecting Paper Guy Scope...\n")
   
-  target_realms <- c(
+  # A. Tropical Core
+  tropical_realms <- c(
     "Central Indo-Pacific",
     "Eastern Indo-Pacific",
     "Western Indo-Pacific"
   )
   
-  # Filter by Realm
-  regions_filtered <- regions %>% filter(REALM %in% target_realms)
+  # B. Specific "Temperate" Additions (Paper Guy includes these)
+  force_include <- c(
+    "West Central Australian Shelf",    # Ningaloo
+    "East Central Australian Shelf",    # Southern GBR
+    "Warm Temperate Northwest Pacific", # Southern Japan
+    "Hawaii", 
+    "Easter Island",
+    "Southeast Polynesia"
+  )
   
-  # Note: He might exclude Hawaii (Prov 40?). 
-  # If you need to strictly exclude Hawaii like some clownfish studies:
-  # regions_filtered <- regions_filtered %>% filter(PROVINCE != "Hawaii")
+  regions_filtered <- regions %>% 
+    filter(REALM %in% tropical_realms | PROVINCE %in% force_include)
   
 } else {
-  # --- THESIS EXPANSION SCOPE ---
-  cat("Selecting Tropical Core + Expansion Zones...\n")
+  cat("Selecting Thesis Expansion Scope...\n")
   
+  # A. Tropical Core
   tropical_realms <- c("Central Indo-Pacific", "Eastern Indo-Pacific", "Western Indo-Pacific")
   
+  # B. Thesis Expansion Zones
   expansion_provinces <- c(
-    "Warm Temperate Northwest Pacific", # Japan (Kuroshio)
-    "Southeast Australian Shelf",       # E. Australia (EAC)
-    "Southwest Australian Shelf",       # W. Australia (Leeuwin)
-    "West Central Australian Shelf",    # W. Australia (Ningaloo)
+    "Warm Temperate Northwest Pacific", # Japan
+    "Southeast Australian Shelf",       # E. Australia
+    "Southwest Australian Shelf",       # W. Australia
+    "West Central Australian Shelf",    # W. Australia
     "East Central Australian Shelf",    # Transition
     "Agulhas",                          # S. Africa
     "Northern New Zealand"              # NZ
@@ -66,12 +72,12 @@ if (PIPELINE_MODE == "REPLICATION") {
 
 cat("Selected", nrow(regions_filtered), "Provinces.\n")
 
-# --- 3. SHIFT LONGITUDE (0-360) ---
-cat("Shifting Longitude to 0-360...\n")
+# --- 3. CLEAN UP & EXPORT ---
+# Shift to 0-360
 regions_shifted <- st_shift_longitude(regions_filtered)
 regions_shifted <- st_make_valid(regions_shifted)
 
-# --- 4. DISSOLVE BY PROVINCE ---
+# Dissolve by Province
 prov_data <- regions_shifted %>%
   group_by(PROVINCE) %>%
   summarise(
@@ -84,9 +90,10 @@ prov_data <- regions_shifted %>%
   ungroup() %>%
   st_make_valid()
 
-# --- 5. EXPORT ---
+# Save Shapefile (Raw Names)
 st_write(prov_data, file.path(DATA_DIR, "marine_regions.shp"), delete_layer = TRUE, quiet=TRUE)
 
+# Export CSV for Reference (Raw Names)
 provs_geom <- prov_data %>% st_cast("MULTIPOLYGON") %>% st_cast("POLYGON")
 provs_geom$id <- 1:nrow(provs_geom)
 coords <- st_coordinates(provs_geom) %>% as.data.frame()

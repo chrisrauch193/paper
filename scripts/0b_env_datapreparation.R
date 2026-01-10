@@ -1,10 +1,12 @@
 # scripts/0b_env_datapreparation.R
 # ------------------------------------------------------------------------------
-# STEP 2: RAW ENV PREPARATION (With Master Switch)
+# STEP 2: RAW ENV PREPARATION (Exact Framing Fix)
 # ------------------------------------------------------------------------------
 
 # !!! MASTER SWITCH !!!
-PIPELINE_MODE <- "EXPANSION" 
+# "REPLICATION" = Paper Guy's Logic (Hard Crop 30-240, Union Mask)
+# "EXPANSION"   = Thesis Logic (Hybrid Mask, Full Range)
+PIPELINE_MODE <- "REPLICATION" 
 
 if(!require("pacman")) install.packages("pacman")
 pacman::p_load(terra, dplyr, readr, sf)
@@ -46,70 +48,79 @@ rug <- rotate_to_360(rast(file.path(TERRAIN_DIR, "rugosity.tif")))
 names(rug) <- "rugosity"
 bathy <- rotate_to_360(rast(file.path(TERRAIN_DIR, "bathymetry_mean.tif")))
 
-# 3. CREATE MASKS BASED ON MODE
+# 3. CREATE MASKS & CROP
 regions <- st_read(REGION_SHP, quiet=TRUE)
 region_mask <- rasterize(vect(regions), clim_stack, field="PROV_CODE")
 
 if(!compareGeom(rug, clim_stack, stopOnError=FALSE)) rug <- resample(rug, clim_stack)
 if(!compareGeom(bathy, clim_stack, stopOnError=FALSE)) bathy <- resample(bathy, clim_stack)
 
-# --- SWITCH LOGIC FOR MASKING ---
 if (PIPELINE_MODE == "REPLICATION") {
-  # A. DEPTH: Strict -200m (Paper Guy Standard)
-  depth_mask <- (bathy > -200)
+  cat("  REPLICATION MODE: Applying Hard Crop (30-240) & Union Mask...\n")
   
-  # B. BIOTIC: Strict Coral Reef Intersection
+  # A. Physiological Mask (Depth > -200 & Temp > 20)
+  depth_condition <- (bathy > -200)
+  temp_condition  <- (clim_stack[["thetao_baseline_depthmax_mean"]] > 20)
+  physio_mask <- depth_condition * temp_condition
+  physio_mask[physio_mask == 0] <- NA
+  
+  # B. Coral Mask
   if(file.exists(CORAL_SHP)) {
-    cat("  REPLICATION MODE: Masking to WCMC Coral Reefs...\n")
-    
-    # 1. Load Coral (Keep in original -180/180 to avoid geometry errors)
+    cat("    Rasterizing Coral...\n")
     coral <- st_read(CORAL_SHP, quiet=TRUE)
-    
-    # 2. Load a temporary raw template (original -180/180 env layer)
-    # We use this to rasterize the coral safely before rotating
     raw_template <- rast(file.path(RAW_ENV_DIR, paste0(CLIMATE_VARS[1], ".tif")))
     
-    # 3. Rasterize Coral on -180/180 grid
-    cat("    Rasterizing Coral Polygons (this may take a moment)...\n")
-    coral_mask_raw <- rasterize(vect(coral), raw_template, field=1, background=NA)
-    
-    # 4. Rotate the Mask to 0-360 (Matches clim_stack)
-    cat("    Rotating Coral Mask to 0-360...\n")
+    # touches=TRUE captures all pixels touching reef
+    coral_mask_raw <- rasterize(vect(coral), raw_template, field=1, background=NA, touches=TRUE)
     coral_mask <- rotate_to_360(coral_mask_raw)
-    
-    # 5. Align with Climate Stack (Fix slight grid shifts if any)
     if(!compareGeom(coral_mask, clim_stack, stopOnError=FALSE)) {
       coral_mask <- resample(coral_mask, clim_stack, method="near")
     }
     
-    # Combined Mask: Region (Tropical) + Depth + Coral
-    final_mask <- region_mask * depth_mask * coral_mask
+    # C. Union Logic
+    cat("    Combining Masks...\n")
+    p_filled <- classify(physio_mask, cbind(NA, 0))
+    c_filled <- classify(coral_mask, cbind(NA, 0))
+    combined <- p_filled + c_filled
+    final_mask <- combined > 0
+    final_mask[final_mask == 0] <- NA
     
-  } else {
-    stop("WCMC Coral Shapefile missing! Cannot run Replication Mode.")
-  }
+    final_mask <- final_mask * region_mask
+    
+  } else { stop("WCMC Coral Shapefile missing!") }
+  
+  # !!! THE FRAMING FIX !!! 
+  # Apply Hard Crop exactly like Paper Guy (30 to 240 Longitude)
+  cat("    Applying Exact Framing Crop (30, 240, -40, 40)...\n")
+  crop_ext <- ext(30, 240, -40, 40)
+  
+  # Crop everything to this exact box
+  clim_stack <- crop(clim_stack, crop_ext)
+  final_mask <- crop(final_mask, crop_ext)
+  rug        <- crop(rug, crop_ext)
+  region_mask <- crop(region_mask, crop_ext)
   
 } else {
   # --- EXPANSION MODE ---
-  # A. DEPTH: Relaxed -1000m (To catch Hawaii/Marquesas islands)
+  cat("  EXPANSION MODE: Hybrid Mask...\n")
   depth_mask <- (bathy > -1000)
-  
-  # B. BIOTIC: Hybrid Mask (Potential Habitat)
-  cat("  EXPANSION MODE: Masking to Potential Habitat (MEOW + Depth)...\n")
   final_mask <- region_mask * depth_mask
+  
+  # Just trim empty space
+  clim_stack <- mask(clim_stack, final_mask)
+  clim_stack <- trim(clim_stack)
+  
+  # Align others
+  final_mask <- crop(final_mask, clim_stack)
+  rug        <- crop(rug, clim_stack); rug <- mask(rug, final_mask)
+  region_mask <- crop(region_mask, clim_stack); region_mask <- mask(region_mask, final_mask)
 }
 
-# Set 0s to NA
 final_mask[final_mask==0] <- NA
 
-# 4. APPLY MASKS & SAVE
-cat("Applying Final Masks and Trimming...\n")
+# 4. FINAL APPLY
+cat("Applying Final Masks...\n")
 clim_stack <- mask(clim_stack, final_mask)
-clim_stack <- trim(clim_stack)
-
-final_mask  <- crop(final_mask, clim_stack)
-rug         <- crop(rug, clim_stack); rug <- mask(rug, final_mask)
-region_mask <- crop(region_mask, clim_stack); region_mask <- mask(region_mask, final_mask)
 
 cat("Final Dimensions:", paste(dim(clim_stack), collapse="x"), "\n")
 
