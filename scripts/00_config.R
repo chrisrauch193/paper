@@ -4,9 +4,9 @@
 # ------------------------------------------------------------------------------
 
 # --- RUN SETTINGS ---
-RUN_ID           <- "test_run"   # "test_run" or "final_run"
-N_CORES          <- 4            # 30 for final
-WIPE_PREDICTIONS <- TRUE         # Force re-run?
+RUN_ID           <- "final_run"   # "test_run" or "final_run"
+N_CORES          <- 30            # 30 for final
+WIPE_PREDICTIONS <- FALSE         # Force re-run?
 
 # --- METHODOLOGY TOGGLES ---
 USE_SPATIAL_THINNING  <- TRUE    # Recommended: TRUE
@@ -15,8 +15,8 @@ BG_SAMPLING_METHOD    <- "paper_exact" # Options: "paper_exact", "nearest_neighb
 
 # --- MODEL PARAMETERS ---
 if (RUN_ID == "final_run") {
-  N_HOST_BOOT <- 10
-  N_FISH_BOOT <- 40
+  N_HOST_BOOT <- 2
+  N_FISH_BOOT <- 2
   TUNE_ARGS   <- list(fc = c("L", "LQ", "H", "LQH"), rm = seq(0.5, 4, 0.5))
 } else {
   N_HOST_BOOT <- 2
@@ -25,8 +25,10 @@ if (RUN_ID == "final_run") {
 }
 
 # --- SPECIES & VARS ---
-TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
-TARGET_FISH  <- c("Amphiprion_clarkii", "Amphiprion_frenatus")
+# TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
+# TARGET_FISH  <- c("Amphiprion_clarkii", "Amphiprion_frenatus")
+TARGET_HOSTS <- NULL
+TARGET_FISH  <- NULL
 # STATIC_VARS  <- c("rugosity", "bathymetry", "slope", "aspect") 
 STATIC_VARS  <- c("rugosity") 
 

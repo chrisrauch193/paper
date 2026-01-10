@@ -1,0 +1,383 @@
+---
+title: "Effects of Host-Dependent Niches on Anemonefish Range Shifts"
+subtitle: "Final Pipeline Analysis"
+author: "Christopher Rauch"
+date: today
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+    theme: cosmo
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+# 1. Setup & Configuration
+
+```{r setup}
+#| label: setup
+
+# --- LIBRARIES ---
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, terra, tidyterra, lme4, lmerTest, emmeans, 
+               knitr, kableExtra, here, rnaturalearth, ggpubr)
+
+# --- PATHS ---
+# CHANGE THIS to "final_run" when ready
+RUN_ID <- "test_run" 
+
+BASE_DIR  <- here::here("outputs", RUN_ID)
+MODEL_DIR <- file.path(BASE_DIR, "models")
+PRED_DIR  <- file.path(BASE_DIR, "predictions")
+FIG_DIR   <- here::here("outputs", "figure_files") 
+
+# --- SOURCE HELPERS ---
+# (Ensure you created this file in scripts/04_post_analysis_helpers.R)
+source(here::here("scripts", "04_post_analysis_helpers.R"))
+
+# --- SPECIES CONFIGURATION ---
+# Comment out species here to exclude them from analysis
+TARGET_SPECIES <- c(
+  # FISH
+  "Amphiprion_clarkii",
+  "Amphiprion_frenatus",
+  # HOSTS
+  "Entacmaea_quadricolor",
+  "Heteractis_magnifica"
+)
+
+# Metadata Table
+SPECIES_META <- data.frame(species = TARGET_SPECIES) %>%
+  mutate(
+    clean_name = gsub("_", " ", species),
+    type = ifelse(str_detect(species, "Amphiprion"), "Fish", "Anemone"),
+    guild = sapply(species, get_specialist_status)
+  )
+
+# Validation
+if (!dir.exists(BASE_DIR)) stop(paste("Run folder not found:", BASE_DIR))
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# World Map for Plotting
+world_map <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+cat("Analysis Target:", length(TARGET_SPECIES), "Species | Run ID:", RUN_ID)
+```
+
+
+# 2. Statistical Analysis: Model Performance
+
+Thesis Question 1: Does the inclusion of host distributions (Biotic Constraints) improve the predictive ability of Anemonefish SDMs?
+
+We compare the Area Under the Curve (AUC) and True Skill Statistic (TSS) across three model types:
+
+EnvOnly: Climate + Rugosity.
+
+HostOnly: Host Suitability + Rugosity.
+
+Combined: Climate + Host Suitability + Rugosity.
+
+```{r load-stats}
+#| label: load-stats
+
+rds_files <- list.files(MODEL_DIR, pattern = "\\.rds$", full.names = TRUE)
+
+stats_df <- map_dfr(rds_files, function(f) {
+  d <- readRDS(f)
+  # Normalize species names
+  d$species <- gsub(" ", "_", d$species)
+  return(d)
+})
+
+# Filter to Target Species only
+stats_clean <- stats_df %>%
+  filter(species %in% TARGET_SPECIES) %>%
+  filter(model %in% c("EnvOnly", "HostOnly", "Combined")) %>% # Exclude Host models for this comparison
+  mutate(model = factor(model, levels = c("EnvOnly", "HostOnly", "Combined")))
+
+# Summary Table
+stats_summary <- stats_clean %>%
+  group_by(model) %>%
+  summarise(
+    Mean_AUC = mean(auc, na.rm=TRUE),
+    SD_AUC = sd(auc, na.rm=TRUE),
+    Mean_TSS = mean(tss, na.rm=TRUE)
+  )
+
+kable(stats_summary, digits = 3, caption = "Model Performance by Type") %>% kable_styling()
+```
+
+```{r plot-performance-boxplot}
+#| label: plot-performance-boxplot
+#| fig-width: 9
+#| fig-height: 6
+
+# Create output dir
+fig_sub_dir <- file.path(FIG_DIR, "model_performance")
+dir.create(fig_sub_dir, showWarnings = FALSE)
+
+p_auc <- ggplot(stats_clean, aes(x = model, y = auc, fill = model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  scale_fill_manual(values = c("EnvOnly" = "#999999", "HostOnly" = "#56B4E9", "Combined" = "#E69F00")) +
+  labs(title = "Model Predictive Power (AUC)", y = "AUC Score", x = NULL) +
+  get_garcia_theme() +
+  theme(legend.position = "none")
+
+# Save
+save_and_print(p_auc, "fig1_AUC_comparison.png", fig_sub_dir)
+```
+
+## Linear Mixed Model
+
+We treat Species as a random effect to account for taxonomic variation.
+
+```{r stats-lmm}
+#| label: stats-lmm
+
+if (n_distinct(stats_clean$model) > 1) {
+  m_auc <- lmer(auc ~ model + (1|species), data = stats_clean)
+  print(summary(m_auc))
+  
+  # Pairwise contrasts
+  print(emmeans::emmeans(m_auc, pairwise ~ model)$contrasts)
+}
+```
+
+
+# 3. Spatial Analysis: Richness & Range Shifts
+
+Thesis Question 2: How will anemonefish biodiversity patterns shift under future climate scenarios?
+
+We define Richness as the sum of Habitat Suitability probabilities (Maxent Logistic Output) across all species in a group.
+
+## A. Current Richness Maps
+
+```{r current-richness}
+#| label: current-richness
+#| fig-width: 12
+#| fig-height: 10
+#| results: asis
+
+fig_sub_dir <- file.path(FIG_DIR, "richness_maps")
+dir.create(fig_sub_dir, showWarnings = FALSE)
+
+# Define Groups
+fish_list <- SPECIES_META %>% filter(type == "Fish") %>% pull(species)
+host_list <- SPECIES_META %>% filter(type == "Anemone") %>% pull(species)
+generalists <- SPECIES_META %>% filter(guild == "Generalist", type == "Fish") %>% pull(species)
+specialists <- SPECIES_META %>% filter(guild == "Specialist", type == "Fish") %>% pull(species)
+
+# Calculate Stacks
+r_fish_curr <- stack_richness(fish_list, file.path(PRED_DIR, "current/fish_combined"))
+r_host_curr <- stack_richness(host_list, file.path(PRED_DIR, "current/hosts"))
+
+# Plot Function
+plot_richness <- function(r, title) {
+  if (is.null(r)) return(NULL)
+  
+  ggplot() +
+    geom_spatraster(data = r) +
+    geom_sf(data = world_map, fill = NA, color = "grey40", linewidth = 0.1) +
+    scale_fill_viridis_c(option = "magma", name = "Richness", na.value = "transparent") +
+    coord_sf(xlim = c(30, 180), ylim = c(-35, 35), expand = FALSE) +
+    labs(title = title) +
+    get_garcia_theme()
+}
+
+# Plot Fish
+if (!is.null(r_fish_curr)) {
+  p1 <- plot_richness(r_fish_curr, "Current Fish Richness (Combined Model)")
+  save_and_print(p1, "richness_current_fish.png", fig_sub_dir)
+}
+
+# Plot Hosts
+if (!is.null(r_host_curr)) {
+  p2 <- plot_richness(r_host_curr, "Current Host Richness")
+  save_and_print(p2, "richness_current_hosts.png", fig_sub_dir)
+}
+```
+
+## B. Future Delta Maps (Change in Suitability)
+
+We calculate Future - Current to visualize gain (Blue) vs. loss (Red).
+
+```{r future-delta}
+#| label: future-delta
+#| fig-width: 12
+#| fig-height: 8
+
+fig_sub_dir <- file.path(FIG_DIR, "delta_maps")
+dir.create(fig_sub_dir, showWarnings = FALSE)
+
+# Loop through available future scenarios
+scenarios <- list.dirs(file.path(PRED_DIR, "future"), full.names = FALSE, recursive = FALSE)
+
+for (scen in scenarios) {
+  cat(paste("### Scenario:", scen, "\n"))
+  
+  # Calculate Future Richness for Fish
+  fut_dir <- file.path(PRED_DIR, "future", scen, "fish_combined")
+  r_fish_fut <- stack_richness(fish_list, fut_dir)
+  
+  if (!is.null(r_fish_fut) && !is.null(r_fish_curr)) {
+    # Calculate Delta
+    r_delta <- calculate_delta(r_fish_curr, r_fish_fut)
+    
+    # Plot Delta
+    p_delta <- ggplot() +
+      geom_spatraster(data = r_delta) +
+      geom_sf(data = world_map, fill = NA, color = "grey40", linewidth = 0.1) +
+      scale_fill_gradient2(
+        low = "#D73027", mid = "white", high = "#4575B4", midpoint = 0,
+        name = "Change", na.value = "transparent"
+      ) +
+      coord_sf(xlim = c(30, 180), ylim = c(-35, 35), expand = FALSE) +
+      labs(title = paste("Richness Change:", scen), subtitle = "Blue = Gain, Red = Loss") +
+      get_garcia_theme()
+    
+    print(save_and_print(p_delta, paste0("delta_richness_", scen, ".png"), fig_sub_dir))
+  }
+}
+```
+
+
+# 4. Conservation Metric: Core Habitat Loss
+
+Thesis Question 3: Are specialist species more vulnerable to range contraction than generalists?
+
+We define "Core Habitat" as the top 20% of current suitability pixels. We calculate what percentage of these pixels remain suitable in the future.
+
+```{r core-loss}
+#| label: core-loss
+#| fig-width: 10
+#| fig-height: 8
+
+# --- 1. CONFIGURATION ---
+# Define Threshold (Top 20% of habitat)
+quantile_thresh <- 0.80
+loss_results <- data.frame()
+
+# Identify Fish Species from Metadata
+fish_list <- SPECIES_META %>% filter(type == "Fish") %>% pull(species)
+
+# Pick a scenario (Prefer ssp585_2100, otherwise take the first available)
+avail_scens <- list.dirs(file.path(PRED_DIR, "future"), full.names = FALSE, recursive = FALSE)
+# Filter for actual scenario folders (ignore root if list.dirs behavior varies)
+avail_scens <- avail_scens[avail_scens != ""] 
+
+target_scen <- ifelse("ssp585_2100" %in% avail_scens, "ssp585_2100", avail_scens[1])
+
+if (!is.na(target_scen) && length(fish_list) > 0) {
+  cat(paste("### Analyzing Core Habitat Loss for Scenario:", target_scen, "\n\n"))
+  
+  for (sp in fish_list) {
+    sp_clean <- gsub(" ", "_", sp)
+    
+    # Load Current & Future Mean Rasters
+    f_curr <- file.path(PRED_DIR, "current/fish_combined", paste0(sp_clean, "_mean.tif"))
+    f_fut  <- file.path(PRED_DIR, "future", target_scen, "fish_combined", paste0(sp_clean, "_mean.tif"))
+    
+    if (file.exists(f_curr) && file.exists(f_fut)) {
+      r_c <- terra::rast(f_curr)
+      r_f <- terra::rast(f_fut)
+      
+      # Determine Core Threshold from Current Distribution
+      vals <- terra::values(r_c, mat=FALSE, na.rm=TRUE)
+      
+      if(length(na.omit(vals)) > 0) {
+        thresh <- quantile(vals, probs = quantile_thresh, na.rm=TRUE)
+        
+        # Create Binary Masks (1 = Core Habitat, 0 = Not)
+        core_curr <- r_c > thresh
+        core_fut  <- r_f > thresh # Using SAME absolute threshold to measure persistence
+        
+        # Ensure Geometry Matches
+        if (!terra::compareGeom(core_curr, core_fut, stopOnError=FALSE)) {
+          core_fut <- terra::resample(core_fut, core_curr, method="near")
+        }
+        
+        # Calculate Pixel Counts
+        pixels_current <- global(core_curr, "sum", na.rm=TRUE)$sum
+        # Interaction (AND logic): Pixel must be core NOW and core LATER to count as persistent
+        pixels_future  <- global(core_curr * core_fut, "sum", na.rm=TRUE)$sum 
+        
+        # Calculate % Loss
+        if (pixels_current > 0) {
+          pct_loss <- (1 - (pixels_future / pixels_current)) * 100
+          
+          # Store Results
+          loss_results <- rbind(loss_results, data.frame(
+            species = sp,
+            pct_loss = pct_loss,
+            guild = get_specialist_status(sp) # Helper function from scripts/04_post_analysis_helpers.R
+          ))
+        }
+      }
+    }
+  }
+} else {
+  cat("Skipping Core Habitat Analysis: No future scenarios or fish species found.\n")
+}
+
+# --- 2. PLOTTING & STATS ---
+if (nrow(loss_results) > 0) {
+  
+  # A. Save & Print Bar Plot
+  fig_sub_dir <- file.path(FIG_DIR, "conservation_metrics")
+  if(!dir.exists(fig_sub_dir)) dir.create(fig_sub_dir, recursive=TRUE)
+  
+  p_loss <- ggplot(loss_results, aes(x = reorder(species, pct_loss), y = pct_loss, fill = guild)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste("Projected Loss of Core Habitat (", target_scen, ")", sep=""),
+      subtitle = paste("Loss of currently high-suitability areas (>", quantile_thresh*100, "th percentile)", sep=""),
+      y = "% Core Habitat Lost", x = NULL, fill = "Guild"
+    ) +
+    scale_fill_manual(values = c("Generalist" = "#00BFC4", "Specialist" = "#F8766D")) +
+    get_garcia_theme()
+  
+  print(save_and_print(p_loss, "core_habitat_loss_bar.png", fig_sub_dir))
+  
+  # B. Robust Statistical Test
+  cat("\n#### Statistical Comparison (Generalist vs. Specialist)\n\n")
+  
+  # Check data distribution
+  guild_counts <- table(loss_results$guild)
+  print(guild_counts)
+  
+  # T-test requires at least 2 groups AND at least 2 observations per group to calculate variance
+  if (length(guild_counts) == 2 && min(guild_counts) >= 2) {
+    test_res <- t.test(pct_loss ~ guild, data = loss_results)
+    print(test_res)
+  } else {
+    cat("\n**Note:** Insufficient data to perform T-test (Need at least 2 Generalists and 2 Specialists).\n")
+    cat("Current run has:", paste(names(guild_counts), guild_counts, sep="=", collapse=", "), "\n")
+  }
+  
+} else {
+  cat("No valid core habitat loss data could be calculated.\n")
+}
+```
+
+
+
+
+
+
+
+
+# Finish
+
+```{r finish}
+#| label: finish
+
+print("DONE")
+```

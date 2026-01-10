@@ -1,6 +1,6 @@
 # scripts/03_pipeline_runner.R
 # ------------------------------------------------------------------------------
-# FINAL SDM PIPELINE: EXECUTION
+# FINAL SDM PIPELINE: GOLD STANDARD (3-Stage Fish + Future Biotic)
 # ------------------------------------------------------------------------------
 
 # 1. SETUP
@@ -15,18 +15,23 @@ source("scripts/01_functions_core.R")
 source("scripts/02_functions_model.R")
 
 # 3. DIRECTORIES
-DIRS <- c("models_stats", "models_tuning", "models", # New 'models' folder for iteration RDS
-          "predictions/current/hosts", "predictions/current/fish_combined", "predictions/current/fish_env_only", "logs")
+DIRS <- c("models_stats", "models_tuning", "models", 
+          "predictions/current/hosts", 
+          "predictions/current/fish_env_only", 
+          "predictions/current/fish_host_only", 
+          "predictions/current/fish_combined", "logs")
 for(d in DIRS) dir.create(file.path(OUTPUT_ROOT, d), recursive=TRUE, showWarnings=FALSE)
 
 # 4. AUTO-WIPE
 if(WIPE_PREDICTIONS) {
   try(unlink(file.path(OUTPUT_ROOT, "models_stats", "*")), silent=T)
-  try(unlink(file.path(OUTPUT_ROOT, "models", "*")), silent=T) # Wipe iteration stats
+  try(unlink(file.path(OUTPUT_ROOT, "models", "*")), silent=T) 
   try(unlink(file.path(OUTPUT_ROOT, "models_tuning", "*")), silent=T)
   try(unlink(file.path(OUTPUT_ROOT, "predictions/current/hosts", "*")), silent=T)
-  try(unlink(file.path(OUTPUT_ROOT, "predictions/current/fish_combined", "*")), silent=T)
   try(unlink(file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", "*")), silent=T)
+  try(unlink(file.path(OUTPUT_ROOT, "predictions/current/fish_host_only", "*")), silent=T)
+  try(unlink(file.path(OUTPUT_ROOT, "predictions/current/fish_combined", "*")), silent=T)
+  # Note: Future folders are wiped/recreated in the loop below
 }
 
 # 5. LOGGING
@@ -35,18 +40,22 @@ if(file.exists(MASTER_LOG)) unlink(MASTER_LOG)
 file.create(MASTER_LOG)
 write_log(MASTER_LOG, paste("--- PIPELINE START | ID:", RUN_ID, "| BG:", BG_SAMPLING_METHOD, "---"))
 
-# 6. DATA
+# 6. DATA LOADING
 cat("Loading Data...\n")
 if(!file.exists(ENV_PATH)) stop("Env Raster missing.")
 current_env <- terra::rast(ENV_PATH)
 packed_env  <- terra::wrap(current_env) 
 
 FUT_FILES <- list.files(FUT_DIR, full=TRUE, pattern="\\.tif$")
+if(length(FUT_FILES) == 0) warning("No future layers found in ", FUT_DIR)
+
 scenario_names <- tools::file_path_sans_ext(basename(FUT_FILES))
+# Create future directories for all scenarios (2050, 2100, etc.)
 for(scen in scenario_names) {
   dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts"), recursive=T, showWarnings=F)
-  dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_combined"), recursive=T, showWarnings=F)
   dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_env_only"), recursive=T, showWarnings=F)
+  dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_host_only"), recursive=T, showWarnings=F)
+  dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_combined"), recursive=T, showWarnings=F)
 }
 
 amph_occ <- as.data.frame(read_csv("data/amph_occ_env_final_dataset.csv", show_col_types=FALSE))
@@ -61,14 +70,12 @@ cl <- makeCluster(N_CORES)
 registerDoParallel(cl)
 clusterEvalQ(cl, { rm(list=ls()); gc() })
 
-# !!! CRITICAL FIX: EXPLICIT EXPORT !!!
 clusterExport(cl, c("packed_env", "FUT_FILES", "scenario_names", "STATIC_VARS",
                     "amph_occ", "anem_occ", "int_mat", "OUTPUT_ROOT", "MASTER_LOG", 
                     "N_HOST_BOOT", "N_FISH_BOOT", "TUNE_ARGS", 
                     "USE_SPATIAL_THINNING", "USE_SPATIAL_TUNING", "BG_SAMPLING_METHOD",
-                    # Explicitly list functions to ensure they cross over
-                    "write_log", "thin_occurrences", "get_bias_corrected_background", 
-                    "get_random_background", "get_biotic_layer", "get_best_params", "fit_bootstrap_worker"),
+                    "write_log", "thin_occurrences", "get_bias_corrected_background", "get_random_background",
+                    "get_biotic_layer", "get_best_params", "fit_bootstrap_worker"),
               envir = environment()) 
 
 clusterEvalQ(cl, { 
@@ -99,10 +106,9 @@ if(!is.null(TARGET_HOSTS)) anem_run_list <- intersect(unique(anem_occ$species), 
 
 foreach(sp = anem_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopar% {
   sp_clean <- gsub(" ", "_", sp)
-  # Stats file checks
   stats_file <- file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_Host_stats.csv"))
   tune_file  <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_Host_params.csv"))
-  pred_file  <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, ".tif"))
+  pred_file  <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_mean.tif"))
   
   if(file.exists(stats_file) && file.exists(pred_file)) return(NULL)
   
@@ -141,14 +147,17 @@ foreach(sp = anem_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopa
       write_csv(as.data.frame(params), tune_file)
     }
     
-    write_log(MASTER_LOG, paste("  > Running Model:", sp))
-    # Note: Passed output_dir for saving RDS iterations
     results <- fit_bootstrap_worker(sp_dat, env_stack, future_stacks, bg_coords, params, n_boot=N_HOST_BOOT, 
                                     sp_name=sp_clean, model_type="Host", output_dir=OUTPUT_ROOT, debug_log=sp_log)
     
     write_csv(results$stats, stats_file)
-    terra::writeRaster(results$current, pred_file, overwrite=TRUE)
-    for(scen in names(results$future)) terra::writeRaster(results$future[[scen]], file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts", paste0(sp_clean, ".tif")), overwrite=TRUE)
+    terra::writeRaster(results$current$mean, file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+    terra::writeRaster(results$current$sd,   file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+    
+    for(scen in names(results$future)) {
+      terra::writeRaster(results$future[[scen]]$mean, file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+      terra::writeRaster(results$future[[scen]]$sd,   file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+    }
     
     write_log(MASTER_LOG, paste("FINISH Host:", sp))
   }, error = function(e) {
@@ -157,14 +166,14 @@ foreach(sp = anem_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopa
 }
 
 # ==============================================================================
-# PHASE 2: FISH (ENV ONLY + COMBINED)
+# PHASE 2: FISH (Models A, B, C)
 # ==============================================================================
 write_log(MASTER_LOG, "--- PHASE 2: FISH ---")
-host_files <- list.files(file.path(OUTPUT_ROOT, "predictions/current/hosts"), full.names=TRUE, pattern="\\.tif$")
+host_files <- list.files(file.path(OUTPUT_ROOT, "predictions/current/hosts"), full.names=TRUE, pattern="_mean\\.tif$")
 if(length(host_files) == 0) stop("CRITICAL: Phase 1 failed.")
 
 hosts_curr <- terra::rast(host_files)
-names(hosts_curr) <- tools::file_path_sans_ext(basename(host_files)) 
+names(hosts_curr) <- tools::file_path_sans_ext(basename(host_files)) %>% gsub("_mean", "", .)
 packed_hosts_curr <- terra::wrap(hosts_curr)
 clusterExport(cl, "packed_hosts_curr", envir = environment())
 
@@ -182,31 +191,39 @@ foreach(sp = fish_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopa
     if(USE_SPATIAL_THINNING) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
     
     # ---------------------------------------------------------
-    # A. ENV ONLY MODEL
+    # A. ENV ONLY MODEL (PC1-4 + Rugosity ONLY)
     # ---------------------------------------------------------
     write_log(MASTER_LOG, paste("START Fish EnvOnly:", sp))
     
+    # Define variables: PCs + Rugosity. Drop extraneous vars (e.g. Slope/Bathy) if unused.
+    # We grab names from the first Future file to know which PCs exist.
+    ref_fut <- terra::rast(FUT_FILES[1])
+    vars_to_keep_env <- c(names(ref_fut), STATIC_VARS)
+    env_stack_model_a <- env_stack_curr[[intersect(names(env_stack_curr), vars_to_keep_env)]]
+    
+    # Background
     if(BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
-      bg_coords <- get_bias_corrected_background(sp_dat, env_stack_curr, method=BG_SAMPLING_METHOD)
+      bg_coords <- get_bias_corrected_background(sp_dat, env_stack_model_a, method=BG_SAMPLING_METHOD)
     } else {
-      bg_coords <- get_random_background(sp_dat, env_stack_curr)
+      bg_coords <- get_random_background(sp_dat, env_stack_model_a)
     }
     
-    # Prepare Futures (Env Only)
+    # Futures
     future_stacks_env <- list()
     for(i in seq_along(FUT_FILES)) {
       scen <- scenario_names[i]
       f_stack <- prepare_future_stack(FUT_FILES[i], env_stack_curr, STATIC_VARS)
-      vars_needed <- names(env_stack_curr)
-      if(all(vars_needed %in% names(f_stack))) future_stacks_env[[scen]] <- f_stack[[vars_needed]]
+      if(all(names(env_stack_model_a) %in% names(f_stack))) {
+        future_stacks_env[[scen]] <- f_stack[[names(env_stack_model_a)]]
+      }
     }
     
-    # Tuning (Env Only)
+    # Tune & Run
     tune_file_env <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishEnvOnly_params.csv"))
     if(file.exists(tune_file_env)) {
       params_env <- read_csv(tune_file_env, show_col_types=FALSE)
     } else {
-      params_env <- get_best_params(sp_dat, env_stack_curr, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
+      params_env <- get_best_params(sp_dat, env_stack_model_a, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
       if(!is.null(params_env)) {
         params_env$fc <- tolower(params_env$fc)
         write_csv(as.data.frame(params_env), tune_file_env)
@@ -214,49 +231,117 @@ foreach(sp = fish_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopa
     }
     
     if(!is.null(params_env)) {
-      results_env <- fit_bootstrap_worker(sp_dat, env_stack_curr, future_stacks_env, bg_coords, params_env, n_boot=N_FISH_BOOT, 
-                                          sp_name=sp_clean, model_type="EnvOnly", output_dir=OUTPUT_ROOT, debug_log=sp_log)
+      res_env <- fit_bootstrap_worker(sp_dat, env_stack_model_a, future_stacks_env, bg_coords, params_env, n_boot=N_FISH_BOOT, 
+                                      sp_name=sp_clean, model_type="EnvOnly", output_dir=OUTPUT_ROOT, debug_log=sp_log)
       
-      write_csv(results_env$stats, file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_FishEnvOnly_stats.csv")))
-      terra::writeRaster(results_env$current, file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", paste0(sp_clean, ".tif")), overwrite=TRUE)
-      for(scen in names(results_env$future)) terra::writeRaster(results_env$future[[scen]], file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_env_only", paste0(sp_clean, ".tif")), overwrite=TRUE)
+      write_csv(res_env$stats, file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_FishEnvOnly_stats.csv")))
+      terra::writeRaster(res_env$current$mean, file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+      terra::writeRaster(res_env$current$sd,   file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+      for(scen in names(res_env$future)) {
+        terra::writeRaster(res_env$future[[scen]]$mean, file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_env_only", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+        terra::writeRaster(res_env$future[[scen]]$sd,   file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_env_only", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+      }
     }
     
     # ---------------------------------------------------------
-    # B. COMBINED MODEL (Env + Host)
+    # PREP HOST DATA (Current)
     # ---------------------------------------------------------
-    write_log(MASTER_LOG, paste("START Fish Combined:", sp))
-    
     biotic_curr <- get_biotic_layer(sp, host_stack_curr, int_mat, debug_path=MASTER_LOG)
+    
     if(!is.null(biotic_curr)) {
-      full_stack_curr <- c(env_stack_curr, biotic_curr)
-      names(full_stack_curr) <- c(names(env_stack_curr), "biotic_suitability")
       
-      # Re-generate Background for full stack (technically same coords, but safer to re-extract)
-      # Note: We reuse 'bg_coords' geometry, but extraction happens inside worker
+      # ---------------------------------------------------------
+      # B. HOST ONLY MODEL (Host + Rugosity)
+      # ---------------------------------------------------------
+      write_log(MASTER_LOG, paste("START Fish HostOnly:", sp))
       
-      # Futures (Combined)
-      future_stacks_comb <- list()
-      for(i in seq_along(FUT_FILES)) {
-        scen <- scenario_names[i]
-        f_env <- prepare_future_stack(FUT_FILES[i], env_stack_curr, STATIC_VARS)
-        f_env <- f_env[[names(env_stack_curr)]] 
-        host_dir_fut <- file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts")
-        host_files_fut <- list.files(host_dir_fut, full.names=TRUE, pattern="\\.tif$")
+      if("rugosity" %in% names(env_stack_curr)) {
+        rug_layer <- env_stack_curr[["rugosity"]]
+        host_only_stack <- c(rug_layer, biotic_curr)
+        names(host_only_stack) <- c("rugosity", "biotic_suitability")
         
-        if(length(host_files_fut) > 0) {
-          host_stack_fut <- terra::rast(host_files_fut)
-          names(host_stack_fut) <- tools::file_path_sans_ext(basename(host_files_fut))
-          biotic_fut <- get_biotic_layer(sp, host_stack_fut, int_mat) 
-          if(!is.null(biotic_fut)) {
-            f_comb <- c(f_env, biotic_fut)
-            names(f_comb) <- c(names(f_env), "biotic_suitability")
-            future_stacks_comb[[scen]] <- f_comb
+        # Futures for Host Only (Static Rugosity + Dynamic Future Host)
+        future_stacks_hostonly <- list()
+        for(i in seq_along(FUT_FILES)) {
+          scen <- scenario_names[i]
+          # 1. Get Static Rugosity
+          f_env_raw <- prepare_future_stack(FUT_FILES[i], env_stack_curr, STATIC_VARS)
+          f_rug <- f_env_raw[["rugosity"]]
+          
+          # 2. Get Future Biotic
+          host_dir_fut <- file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts")
+          host_files_fut <- list.files(host_dir_fut, full.names=TRUE, pattern="_mean\\.tif$")
+          if(length(host_files_fut) > 0) {
+            h_stack_f <- terra::rast(host_files_fut)
+            names(h_stack_f) <- tools::file_path_sans_ext(basename(host_files_fut)) %>% gsub("_mean", "", .)
+            biotic_fut <- get_biotic_layer(sp, h_stack_f, int_mat)
+            if(!is.null(biotic_fut)) {
+              f_comb <- c(f_rug, biotic_fut)
+              names(f_comb) <- c("rugosity", "biotic_suitability")
+              future_stacks_hostonly[[scen]] <- f_comb
+            }
+          }
+        }
+        
+        tune_file_host <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishHostOnly_params.csv"))
+        if(file.exists(tune_file_host)) {
+          params_host <- read_csv(tune_file_host, show_col_types=FALSE)
+        } else {
+          params_host <- get_best_params(sp_dat, host_only_stack, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
+          if(!is.null(params_host)) {
+            params_host$fc <- tolower(params_host$fc)
+            write_csv(as.data.frame(params_host), tune_file_host)
+          }
+        }
+        
+        if(!is.null(params_host)) {
+          res_ho <- fit_bootstrap_worker(sp_dat, host_only_stack, future_stacks_hostonly, bg_coords, params_host, n_boot=N_FISH_BOOT, 
+                                         sp_name=sp_clean, model_type="HostOnly", output_dir=OUTPUT_ROOT, debug_log=sp_log)
+          
+          write_csv(res_ho$stats, file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_FishHostOnly_stats.csv")))
+          terra::writeRaster(res_ho$current$mean, file.path(OUTPUT_ROOT, "predictions/current/fish_host_only", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+          terra::writeRaster(res_ho$current$sd,   file.path(OUTPUT_ROOT, "predictions/current/fish_host_only", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+          for(scen in names(res_ho$future)) {
+            terra::writeRaster(res_ho$future[[scen]]$mean, file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_host_only", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+            terra::writeRaster(res_ho$future[[scen]]$sd,   file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_host_only", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
           }
         }
       }
       
-      # Tuning (Combined)
+      # ---------------------------------------------------------
+      # C. COMBINED MODEL (Env + Host)
+      # ---------------------------------------------------------
+      write_log(MASTER_LOG, paste("START Fish Combined:", sp))
+      
+      # Stack: Env Only (PCs+Rug) + Biotic
+      full_stack_curr <- c(env_stack_model_a, biotic_curr)
+      names(full_stack_curr) <- c(names(env_stack_model_a), "biotic_suitability")
+      
+      # Futures (Env + Future Host)
+      future_stacks_comb <- list()
+      for(i in seq_along(FUT_FILES)) {
+        scen <- scenario_names[i]
+        # 1. Get Env Part
+        f_stack_raw <- prepare_future_stack(FUT_FILES[i], env_stack_curr, STATIC_VARS)
+        if(all(names(env_stack_model_a) %in% names(f_stack_raw))) {
+          f_env <- f_stack_raw[[names(env_stack_model_a)]]
+          
+          # 2. Get Biotic Part (Future)
+          host_dir_fut <- file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts")
+          host_files_fut <- list.files(host_dir_fut, full.names=TRUE, pattern="_mean\\.tif$")
+          if(length(host_files_fut) > 0) {
+            h_stack_f <- terra::rast(host_files_fut)
+            names(h_stack_f) <- tools::file_path_sans_ext(basename(host_files_fut)) %>% gsub("_mean", "", .)
+            biotic_fut <- get_biotic_layer(sp, h_stack_f, int_mat) 
+            if(!is.null(biotic_fut)) {
+              f_comb <- c(f_env, biotic_fut)
+              names(f_comb) <- c(names(f_env), "biotic_suitability")
+              future_stacks_comb[[scen]] <- f_comb
+            }
+          }
+        }
+      }
+      
       tune_file_comb <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishCombined_params.csv"))
       if(file.exists(tune_file_comb)) {
         params_comb <- read_csv(tune_file_comb, show_col_types=FALSE)
@@ -269,12 +354,16 @@ foreach(sp = fish_run_list, .packages=c('terra','dplyr','maxnet','dismo')) %dopa
       }
       
       if(!is.null(params_comb)) {
-        results_comb <- fit_bootstrap_worker(sp_dat, full_stack_curr, future_stacks_comb, bg_coords, params_comb, n_boot=N_FISH_BOOT, 
-                                             sp_name=sp_clean, model_type="Combined", output_dir=OUTPUT_ROOT, debug_log=sp_log)
+        res_comb <- fit_bootstrap_worker(sp_dat, full_stack_curr, future_stacks_comb, bg_coords, params_comb, n_boot=N_FISH_BOOT, 
+                                         sp_name=sp_clean, model_type="Combined", output_dir=OUTPUT_ROOT, debug_log=sp_log)
         
-        write_csv(results_comb$stats, file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_FishCombined_stats.csv")))
-        terra::writeRaster(results_comb$current, file.path(OUTPUT_ROOT, "predictions/current/fish_combined", paste0(sp_clean, ".tif")), overwrite=TRUE)
-        for(scen in names(results_comb$future)) terra::writeRaster(results_comb$future[[scen]], file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_combined", paste0(sp_clean, ".tif")), overwrite=TRUE)
+        write_csv(res_comb$stats, file.path(OUTPUT_ROOT, "models_stats", paste0(sp_clean, "_FishCombined_stats.csv")))
+        terra::writeRaster(res_comb$current$mean, file.path(OUTPUT_ROOT, "predictions/current/fish_combined", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+        terra::writeRaster(res_comb$current$sd,   file.path(OUTPUT_ROOT, "predictions/current/fish_combined", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+        for(scen in names(res_comb$future)) {
+          terra::writeRaster(res_comb$future[[scen]]$mean, file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_combined", paste0(sp_clean, "_mean.tif")), overwrite=TRUE)
+          terra::writeRaster(res_comb$future[[scen]]$sd,   file.path(OUTPUT_ROOT, "predictions/future", scen, "fish_combined", paste0(sp_clean, "_sd.tif")), overwrite=TRUE)
+        }
       }
     }
     

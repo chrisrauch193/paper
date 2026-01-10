@@ -23,7 +23,7 @@ get_best_params <- function(occ_df, env_stack, bg_coords, use_spatial, tune_args
   }, error = function(e) { return(NULL) })
 }
 
-# UPDATED: Saves RDS per iteration for Post-Analysis
+# UPDATED: Calculates Mean AND SD
 fit_bootstrap_worker <- function(occ_df, current_stack, future_stack_list=NULL, bg_coords, params, n_boot=10, 
                                  sp_name, model_type, output_dir, debug_log=NULL) {
   
@@ -34,6 +34,7 @@ fit_bootstrap_worker <- function(occ_df, current_stack, future_stack_list=NULL, 
     }
   }
   
+  # Anonymize
   original_names <- names(current_stack)
   safe_names <- paste0("v", sprintf("%02d", 1:length(original_names)))
   names(current_stack) <- safe_names
@@ -65,20 +66,28 @@ fit_bootstrap_worker <- function(occ_df, current_stack, future_stack_list=NULL, 
     pres_data_all <- pres_data_all[, valid_vars, drop=FALSE]
   }
   
-  sum_curr <- terra::rast(current_stack[[1]]); terra::values(sum_curr) <- 0
-  names(sum_curr) <- "probability"
-  sum_fut_list <- list()
+  # --- INITIALIZE OUTPUTS (Welford's Method or simple Sum/SumSq) ---
+  # We use Sum/SumSq to calculate SD at the end: SD = sqrt( (SumSq - (Sum^2)/N) / (N-1) )
+  
+  # Helper to create empty raster
+  init_rast <- function(r) { x <- terra::rast(r); terra::values(x) <- 0; return(x) }
+  
+  sum_curr    <- init_rast(current_stack[[1]])
+  sum_sq_curr <- init_rast(current_stack[[1]])
+  
+  sum_fut_list    <- list()
+  sum_sq_fut_list <- list()
+  
   if(!is.null(future_stack_list)) {
     for(n in names(future_stack_list)) {
-      r <- terra::rast(future_stack_list[[n]][[1]]); terra::values(r) <- 0; names(r) <- "probability"
-      sum_fut_list[[n]] <- r
+      sum_fut_list[[n]]    <- init_rast(future_stack_list[[n]][[1]])
+      sum_sq_fut_list[[n]] <- init_rast(future_stack_list[[n]][[1]])
     }
   }
   
   stats_list <- list()
   successful_boots <- 0
   
-  # LOOP
   for(i in 1:n_boot) {
     set.seed(i)
     tryCatch({
@@ -100,33 +109,51 @@ fit_bootstrap_worker <- function(occ_df, current_stack, future_stack_list=NULL, 
       pred_test_bg <- stats::predict(mod, bg_data[eval_bg_idx, , drop=FALSE], type="logistic")
       e <- dismo::evaluate(p=as.vector(pred_test_p), a=as.vector(pred_test_bg))
       
-      # SAVE ITERATION STATS (For LMM Analysis)
       iter_stats <- data.frame(species=sp_name, model=model_type, iter=i, auc=e@auc, tss=max(e@TPR + e@TNR - 1))
       stats_list[[i]] <- iter_stats
-      
-      # Save individual model object if needed? (Usually too big, stick to stats)
       saveRDS(iter_stats, file.path(output_dir, "models", paste0(sp_name, "_", model_type, "_iter", i, ".rds")))
       
+      # --- PROJECTION & ACCUMULATION ---
       pred_c <- terra::predict(current_stack, mod, type="logistic", na.rm=TRUE)
-      sum_curr <- sum_curr + pred_c
+      sum_curr    <- sum_curr + pred_c
+      sum_sq_curr <- sum_sq_curr + (pred_c^2)
+      
       if(!is.null(future_stack_list)) {
         for(n in names(future_stack_list)) {
           pred_f <- terra::predict(future_stack_list[[n]], mod, type="logistic", na.rm=TRUE)
-          sum_fut_list[[n]] <- sum_fut_list[[n]] + pred_f
+          sum_fut_list[[n]]    <- sum_fut_list[[n]] + pred_f
+          sum_sq_fut_list[[n]] <- sum_sq_fut_list[[n]] + (pred_f^2)
         }
       }
+      
       successful_boots <- successful_boots + 1
-      log_debug(paste("Iter", i, "OK | AUC:", round(e@auc, 3)))
+      log_debug(paste(model_type, "| Iter", i, "OK | AUC:", round(e@auc, 3)))
     }, error = function(e) { log_debug(paste("Iter", i, "Error:", e$message)) })
   }
   
   if(successful_boots == 0) stop("All bootstrap iterations failed.")
   
-  mean_curr <- sum_curr / successful_boots
-  mean_fut_list <- list()
-  if(!is.null(future_stack_list)) {
-    for(n in names(future_stack_list)) mean_fut_list[[n]] <- sum_fut_list[[n]] / successful_boots
+  # --- CALCULATE MEAN AND SD ---
+  calc_mean_sd <- function(sum_r, sum_sq_r, N) {
+    mean_r <- sum_r / N
+    # Variance = (SumSq - (Sum^2)/N) / (N-1)
+    var_r  <- (sum_sq_r - (sum_r^2)/N) / (N - 1)
+    # Clamp negative variance (precision errors) to 0
+    var_r[var_r < 0] <- 0
+    sd_r   <- sqrt(var_r)
+    names(mean_r) <- "mean_prob"
+    names(sd_r)   <- "sd_prob"
+    return(list(mean=mean_r, sd=sd_r))
   }
   
-  return(list(current = mean_curr, future = mean_fut_list, stats = dplyr::bind_rows(stats_list)))
+  res_curr <- calc_mean_sd(sum_curr, sum_sq_curr, successful_boots)
+  
+  res_fut_list <- list()
+  if(!is.null(future_stack_list)) {
+    for(n in names(future_stack_list)) {
+      res_fut_list[[n]] <- calc_mean_sd(sum_fut_list[[n]], sum_sq_fut_list[[n]], successful_boots)
+    }
+  }
+  
+  return(list(current = res_curr, future = res_fut_list, stats = dplyr::bind_rows(stats_list)))
 }

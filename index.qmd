@@ -1,5 +1,5 @@
 ---
-title: "Anemonefish Mutualism Analysis Results"
+title: "Anemonefish Mutualism: Pipeline Results"
 format: html
 editor: visual
 execute:
@@ -8,13 +8,321 @@ execute:
   message: false
 ---
 
-# Drivers of Host Sea Anemone and Anemonefish Richness
+# Analysis Configuration
 
-This section replicates the initial data loading and processing steps from the desert ant paper's results section, adapted for the anemonefish-anemone mutualism. We load the current predicted suitability rasters for host sea anemones and anemonefish (environmental-only models), calculate community richness, and crop them to the Indo-Pacific study area.
+This document analyzes the outputs of the \*\*3-Stage Parallel SDM Pipeline\*\*. It compares the performance of \*\*EnvOnly\*\*, \*\*HostOnly\*\*, and \*\*Combined\*\* models and visualizes current and future distributions.
 
-```{r setup-libraries-and-config}
-#| label: setup-libraries-and-config
-#| message: false
-#| warning: false
+```{r setup}
+#| label: setup
+
+# --- 1. CONFIGURATION ---------------------------------------------------------
+# CHANGE THIS to switch between "test_run" and "final_run"
+RUN_ID <- "test_run" 
+# ------------------------------------------------------------------------------
+
+# Libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, terra, tidyterra, lme4, lmerTest, knitr, kableExtra, here, rnaturalearth)
+
+# Define Paths based on Run ID
+BASE_DIR <- here::here("outputs", RUN_ID)
+MODEL_DIR <- file.path(BASE_DIR, "models")
+PRED_DIR  <- file.path(BASE_DIR, "predictions")
+
+# Validation
+if (!dir.exists(BASE_DIR)) stop(paste("Directory not found:", BASE_DIR))
+cat(paste("Analyzing output from:", RUN_ID, "\n"))
+```
+
+# 1. Statistical Comparison (The Looper Results)
+
+We extract the cross-validation statistics (AUC & TSS) from the individual bootstrap iterations saved in the `.rds` files.
+
+```{r load-model-stats}
+#| label: load-model-stats
+
+# List all RDS files
+rds_files <- list.files(MODEL_DIR, pattern = "\\.rds$", full.names = TRUE)
+
+if (length(rds_files) == 0) {
+  stop("No model RDS files found. Did the pipeline run?")
+}
+
+# Function to parse filename and read stats
+read_model_stats <- function(fpath) {
+  # Filename format: Species_Name_Type_iterX.rds
+  fname <- basename(fpath)
+  
+  # Regex extraction
+  # Type can be EnvOnly, HostOnly, Combined, or Host (for anemones)
+  type <- str_extract(fname, "(EnvOnly|HostOnly|Combined|Host)")
+  iter <- str_extract(fname, "(?<=iter)\\d+")
+  
+  # Species is everything before the Type
+  # Remove the type and the trailing underscore
+  sp   <- str_remove(fname, paste0("_", type, ".*"))
+  
+  # Read RDS
+  df <- readRDS(fpath)
+  
+  if(nrow(df) > 0) {
+    return(data.frame(
+      species = sp,
+      model_type = type,
+      iteration = as.numeric(iter),
+      auc = df$auc, 
+      tss = df$tss
+    ))
+  } else {
+    return(NULL)
+  }
+}
+
+stats_df <- map_dfr(rds_files, read_model_stats)
+
+# Clean Species Names
+stats_df$species <- gsub("_", " ", stats_df$species)
+
+# Separate Fish from Host models for comparison
+fish_stats <- stats_df %>% filter(model_type %in% c("EnvOnly", "HostOnly", "Combined"))
+host_stats <- stats_df %>% filter(model_type == "Host")
+
+head(fish_stats) %>% kable() %>% kable_styling()
+```
+
+## Model Performance (Boxplot)
+
+Comparing the three competing fish hypotheses.
+
+```{r plot-performance}
+#| label: plot-performance
+#| fig-width: 10
+#| fig-height: 6
+
+# Summary Stats
+summary_stats <- fish_stats %>%
+  group_by(model_type) %>%
+  summarise(
+    Mean_AUC = mean(auc, na.rm=TRUE),
+    SD_AUC = sd(auc, na.rm=TRUE),
+    Mean_TSS = mean(tss, na.rm=TRUE),
+    N = n()
+  )
+
+print(summary_stats)
+
+# Boxplot AUC
+p1 <- ggplot(fish_stats, aes(x = model_type, y = auc, fill = model_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(
+    title = "Model Performance (AUC)",
+    subtitle = "Higher is better",
+    y = "AUC",
+    x = "Hypothesis"
+  ) +
+  scale_fill_manual(values = c("EnvOnly" = "grey70", "HostOnly" = "#56B4E9", "Combined" = "#E69F00")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# Boxplot TSS
+p2 <- ggplot(fish_stats, aes(x = model_type, y = tss, fill = model_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(
+    title = "Model Performance (TSS)",
+    subtitle = "Higher is better",
+    y = "TSS",
+    x = "Hypothesis"
+  ) +
+  scale_fill_manual(values = c("EnvOnly" = "grey70", "HostOnly" = "#56B4E9", "Combined" = "#E69F00")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+print(p1)
+print(p2)
+```
+
+## Significance Test (LMM)
+
+Does adding the Host layer significantly improve model fit compared to Environment Only?
+
+```{r run-lmm}
+#| label: run-lmm
+
+if (length(unique(fish_stats$model_type)) > 1) {
+  # AUC
+  cat("--- AUC Comparison ---\n")
+  m_auc <- lmer(auc ~ model_type + (1|species), data = fish_stats)
+  print(summary(m_auc))
+  
+  # Pairwise comparison (if needed)
+  # pacman::p_load(emmeans)
+  # emmeans(m_auc, pairwise ~ model_type)
+  
+} else {
+  cat("Not enough model types for comparison.")
+}
+```
+
+# 2. Maps: Current Distribution
+
+Visualizing the **Ensemble Mean** (Probability) and **Uncertainty** (Standard Deviation).
+
+```{r map-functions}
+#| label: map-functions
+
+# Helper Function: Plot Garcia-Style Map
+plot_garcia_style <- function(r, title_text, fill_scale="prob") {
+  
+  world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+  
+  # Determine colors based on type
+  if (fill_scale == "prob") {
+    # Garcia Jimenez 2024 Style (Yellow-Orange-Purple-Blue)
+    cols <- c("#FEF9C3", "#FDBA74", "#D946EF", "#4F46E5", "#0C0933")
+    fill_lab <- "Probability"
+    lims <- c(0, 1)
+  } else {
+    # Uncertainty (White to Red)
+    cols <- c("white", "#FED976", "#FD8D3C", "#E31A1C", "#800026")
+    fill_lab <- "Uncertainty (SD)"
+    lims <- c(0, 0.5) # SD usually maxes around 0.5
+  }
+  
+  ggplot() +
+    geom_spatraster(data = r) +
+    geom_sf(data = world, fill = NA, color = "grey40", linewidth = 0.15) +
+    scale_fill_gradientn(
+      colors = cols,
+      na.value = "transparent",
+      name = fill_lab,
+      limits = lims,
+      oob = scales::squish # Handle values slightly outside limits
+    ) +
+    coord_sf(xlim = c(30, 180), ylim = c(-35, 35), expand = FALSE) +
+    labs(title = title_text, x = NULL, y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.background = element_rect(fill = "white", color = "black"),
+      legend.position = "right",
+      axis.text = element_text(size = 8, color = "grey40")
+    )
+}
+```
+
+## Host Maps
+
+```{r plot-hosts}
+#| label: plot-hosts
+#| results: asis
+#| fig-width: 12
+#| fig-height: 5
+
+host_dir <- file.path(PRED_DIR, "current", "hosts")
+# Get only MEAN files
+host_files <- list.files(host_dir, pattern = "_mean\\.tif$", full.names = TRUE)
+
+if(length(host_files) > 0) {
+  for (f in host_files) {
+    sp_name <- basename(f) %>% str_remove("_mean\\.tif") %>% gsub("_", " ", .)
+    
+    # Load Mean and SD
+    r_mean <- terra::rast(f)
+    f_sd   <- str_replace(f, "_mean", "_sd")
+    r_sd   <- if(file.exists(f_sd)) terra::rast(f_sd) else NULL
+    
+    # Plot Mean
+    p1 <- plot_garcia_style(r_mean, paste(sp_name, "(Mean)"), "prob")
+    print(p1)
+    
+    # Plot SD (if exists)
+    if(!is.null(r_sd)) {
+      p2 <- plot_garcia_style(r_sd, paste(sp_name, "(Uncertainty)"), "sd")
+      print(p2)
+    }
+    cat("\n\n")
+  }
+} else {
+  cat("No Host Maps found.")
+}
+```
+
+## Fish Combined Maps
+
+```{r plot-fish}
+#| label: plot-fish
+#| results: asis
+#| fig-width: 12
+#| fig-height: 5
+
+fish_dir <- file.path(PRED_DIR, "current", "fish_combined")
+fish_files <- list.files(fish_dir, pattern = "_mean\\.tif$", full.names = TRUE)
+
+if(length(fish_files) > 0) {
+  for (f in fish_files) {
+    sp_name <- basename(f) %>% str_remove("_mean\\.tif") %>% gsub("_", " ", .)
+    
+    r_mean <- terra::rast(f)
+    f_sd   <- str_replace(f, "_mean", "_sd")
+    r_sd   <- if(file.exists(f_sd)) terra::rast(f_sd) else NULL
+    
+    p1 <- plot_garcia_style(r_mean, paste(sp_name, "Combined (Mean)"), "prob")
+    print(p1)
+    
+    if(!is.null(r_sd)) {
+      p2 <- plot_garcia_style(r_sd, paste(sp_name, "Combined (SD)"), "sd")
+      print(p2)
+    }
+    cat("\n\n")
+  }
+} else {
+  cat("No Fish Combined Maps found.")
+}
+```
+
+# 3. Future Projections (Range Shifts)
+
+Checking the future scenarios (e.g., SSP5-8.5 2100).
+
+```{r plot-future}
+#| label: plot-future
+#| results: asis
+#| fig-width: 10
+#| fig-height: 6
+
+# List all future scenario folders
+fut_scenarios <- list.dirs(file.path(PRED_DIR, "future"), full.names = FALSE, recursive = FALSE)
+
+if (length(fut_scenarios) > 0) {
+  for (scen in fut_scenarios) {
+    cat(paste("\n### Scenario:", scen, "\n\n"))
+    
+    # Check Fish Combined for this scenario
+    fut_fish_dir <- file.path(PRED_DIR, "future", scen, "fish_combined")
+    fut_files <- list.files(fut_fish_dir, pattern = "_mean\\.tif$", full.names = TRUE)
+    
+    if(length(fut_files) > 0) {
+      for(f in fut_files) {
+        sp_name <- basename(f) %>% str_remove("_mean\\.tif") %>% gsub("_", " ", .)
+        r <- terra::rast(f)
+        print(plot_garcia_style(r, paste(sp_name, "-", scen), "prob"))
+        cat("\n\n")
+      }
+    } else {
+      cat("No predictions for this scenario.\n")
+    }
+  }
+} else {
+  cat("No future scenarios found.")
+}
+```
+
+## Host Maps
+
+```{r setup}
+#| label: setup
+
+
 
 ```
