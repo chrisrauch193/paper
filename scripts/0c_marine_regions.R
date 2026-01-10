@@ -15,7 +15,7 @@ BASE_DIR <- getwd()
 DATA_DIR <- file.path(BASE_DIR, "data")
 SHP_DIR  <- file.path(DATA_DIR, "shapefiles")
 MEOW_SHP <- file.path(SHP_DIR, "meow_ecos.shp")
-PAPER_GUY_FILE <- file.path(DATA_DIR, "paper_guy_meow_ecos_df.csv")
+PAPER_FILE <- file.path(DATA_DIR, "paper_guy_meow_ecos_df.csv")
 
 cat("--- RUNNING IN", PIPELINE_MODE, "MODE ---\n")
 
