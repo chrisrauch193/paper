@@ -1,12 +1,10 @@
 # scripts/0b_env_datapreparation.R
 # ------------------------------------------------------------------------------
-# STEP 2: RAW ENV PREPARATION (Exact Framing Fix)
+# STEP 2: RAW ENV PREPARATION (Dual Mode)
 # ------------------------------------------------------------------------------
 
 # !!! MASTER SWITCH !!!
-# "REPLICATION" = Paper Guy's Logic (Hard Crop 30-240, Union Mask)
-# "EXPANSION"   = Thesis Logic (Hybrid Mask, Full Range)
-PIPELINE_MODE <- "REPLICATION" 
+PIPELINE_MODE <- "EXPANSION" 
 
 if(!require("pacman")) install.packages("pacman")
 pacman::p_load(terra, dplyr, readr, sf)
@@ -16,11 +14,20 @@ DATA_DIR    <- file.path(BASE_DIR, "data")
 RAW_ENV_DIR <- file.path(DATA_DIR, "env", "current")
 TERRAIN_DIR <- file.path(DATA_DIR, "env", "terrain")
 SHP_DIR     <- file.path(DATA_DIR, "shapefiles")
-REGION_SHP  <- file.path(DATA_DIR, "marine_regions.shp")
 CORAL_SHP   <- file.path(SHP_DIR, "WCMC008_CoralReef2018_Py_v4_1.shp")
 
 cat("--- RUNNING IN", PIPELINE_MODE, "MODE ---\n")
 
+# 1. SETUP PATHS BASED ON MODE
+if (PIPELINE_MODE == "REPLICATION") {
+  REGION_SHP <- file.path(DATA_DIR, "marine_regions_strict.shp")
+  OUT_RDS    <- file.path(DATA_DIR, "env_stack_intermediate_strict.rds")
+} else {
+  REGION_SHP <- file.path(DATA_DIR, "marine_regions.shp")
+  OUT_RDS    <- file.path(DATA_DIR, "env_stack_intermediate.rds")
+}
+
+# 2. LOAD RASTERS (Standard logic)
 CLIMATE_VARS <- c("sws_baseline_depthsurf_mean", "so_baseline_depthmax_mean", 
                   "thetao_baseline_depthmax_mean", "no3_baseline_depthmax_mean", 
                   "no3_baseline_depthmax_range", "chl_baseline_depthmax_mean", 
@@ -34,21 +41,16 @@ rotate_to_360 <- function(r) {
   return(m)
 }
 
-# 1. Load Climate
-cat("Processing Climate Layers...\n")
+cat("Loading Rasters...\n")
 clim_list <- list()
-for(v in CLIMATE_VARS) {
-  r <- rast(file.path(RAW_ENV_DIR, paste0(v, ".tif")))
-  clim_list[[v]] <- rotate_to_360(r)
-}
+for(v in CLIMATE_VARS) clim_list[[v]] <- rotate_to_360(rast(file.path(RAW_ENV_DIR, paste0(v, ".tif"))))
 clim_stack <- rast(clim_list)
 
-# 2. Load Rugosity & Bathy
 rug <- rotate_to_360(rast(file.path(TERRAIN_DIR, "rugosity.tif")))
 names(rug) <- "rugosity"
 bathy <- rotate_to_360(rast(file.path(TERRAIN_DIR, "bathymetry_mean.tif")))
 
-# 3. CREATE MASKS & CROP
+# 3. MASKING LOGIC
 regions <- st_read(REGION_SHP, quiet=TRUE)
 region_mask <- rasterize(vect(regions), clim_stack, field="PROV_CODE")
 
@@ -56,79 +58,42 @@ if(!compareGeom(rug, clim_stack, stopOnError=FALSE)) rug <- resample(rug, clim_s
 if(!compareGeom(bathy, clim_stack, stopOnError=FALSE)) bathy <- resample(bathy, clim_stack)
 
 if (PIPELINE_MODE == "REPLICATION") {
-  cat("  REPLICATION MODE: Applying Hard Crop (30-240) & Union Mask...\n")
+  cat("  REPLICATION: Hard Crop (30-240) + Union Mask\n")
   
-  # A. Physiological Mask (Depth > -200 & Temp > 20)
-  depth_condition <- (bathy > -200)
-  temp_condition  <- (clim_stack[["thetao_baseline_depthmax_mean"]] > 20)
-  physio_mask <- depth_condition * temp_condition
+  # A. Physio Mask
+  physio_mask <- (bathy > -200) * (clim_stack[["thetao_baseline_depthmax_mean"]] > 20)
   physio_mask[physio_mask == 0] <- NA
   
   # B. Coral Mask
-  if(file.exists(CORAL_SHP)) {
-    cat("    Rasterizing Coral...\n")
-    coral <- st_read(CORAL_SHP, quiet=TRUE)
-    raw_template <- rast(file.path(RAW_ENV_DIR, paste0(CLIMATE_VARS[1], ".tif")))
-    
-    # touches=TRUE captures all pixels touching reef
-    coral_mask_raw <- rasterize(vect(coral), raw_template, field=1, background=NA, touches=TRUE)
-    coral_mask <- rotate_to_360(coral_mask_raw)
-    if(!compareGeom(coral_mask, clim_stack, stopOnError=FALSE)) {
-      coral_mask <- resample(coral_mask, clim_stack, method="near")
-    }
-    
-    # C. Union Logic
-    cat("    Combining Masks...\n")
-    p_filled <- classify(physio_mask, cbind(NA, 0))
-    c_filled <- classify(coral_mask, cbind(NA, 0))
-    combined <- p_filled + c_filled
-    final_mask <- combined > 0
-    final_mask[final_mask == 0] <- NA
-    
-    final_mask <- final_mask * region_mask
-    
-  } else { stop("WCMC Coral Shapefile missing!") }
+  coral <- st_read(CORAL_SHP, quiet=TRUE)
+  coral_mask <- rasterize(vect(coral), clim_stack, field=1, background=NA, touches=TRUE) %>% rotate_to_360()
   
-  # !!! THE FRAMING FIX !!! 
-  # Apply Hard Crop exactly like Paper Guy (30 to 240 Longitude)
-  cat("    Applying Exact Framing Crop (30, 240, -40, 40)...\n")
+  # C. Union
+  final_mask <- (classify(physio_mask, cbind(NA,0)) + classify(coral_mask, cbind(NA,0))) > 0
+  final_mask[final_mask == 0] <- NA
+  final_mask <- final_mask * region_mask
+  
+  # D. HARD CROP (Matches Paper Guy Exact Frame)
   crop_ext <- ext(30, 240, -40, 40)
-  
-  # Crop everything to this exact box
   clim_stack <- crop(clim_stack, crop_ext)
   final_mask <- crop(final_mask, crop_ext)
   rug        <- crop(rug, crop_ext)
   region_mask <- crop(region_mask, crop_ext)
   
 } else {
-  # --- EXPANSION MODE ---
-  cat("  EXPANSION MODE: Hybrid Mask...\n")
-  depth_mask <- (bathy > -1000)
-  final_mask <- region_mask * depth_mask
+  cat("  EXPANSION: Hybrid Mask + Full Extent\n")
+  final_mask <- region_mask * (bathy > -1000)
   
-  # Just trim empty space
-  clim_stack <- mask(clim_stack, final_mask)
-  clim_stack <- trim(clim_stack)
-  
-  # Align others
+  # Trim only empty space, no hard geographic crop
+  clim_stack <- mask(clim_stack, final_mask) %>% trim()
   final_mask <- crop(final_mask, clim_stack)
-  rug        <- crop(rug, clim_stack); rug <- mask(rug, final_mask)
-  region_mask <- crop(region_mask, clim_stack); region_mask <- mask(region_mask, final_mask)
+  rug        <- crop(rug, clim_stack) %>% mask(final_mask)
+  region_mask <- crop(region_mask, clim_stack) %>% mask(final_mask)
 }
 
 final_mask[final_mask==0] <- NA
-
-# 4. FINAL APPLY
-cat("Applying Final Masks...\n")
 clim_stack <- mask(clim_stack, final_mask)
 
-cat("Final Dimensions:", paste(dim(clim_stack), collapse="x"), "\n")
-
-saveRDS(list(
-  clim = terra::wrap(clim_stack), 
-  rug  = terra::wrap(rug), 
-  mask = terra::wrap(final_mask), 
-  region_mask = terra::wrap(region_mask)
-), file.path(DATA_DIR, "env_stack_intermediate.rds"))
-
-cat("Saved Intermediate Stack (Wrapped).\n")
+# 4. SAVE
+saveRDS(list(clim = terra::wrap(clim_stack), rug = terra::wrap(rug), mask = terra::wrap(final_mask), region_mask = terra::wrap(region_mask)), OUT_RDS)
+cat("Saved RDS to:", OUT_RDS, "\n")

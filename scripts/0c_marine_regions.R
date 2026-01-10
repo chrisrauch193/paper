@@ -1,104 +1,102 @@
 # scripts/0c_marine_regions.R
 # ------------------------------------------------------------------------------
-# STEP 1: PREPARE MARINE REGIONS (Hard-Coded Lists)
+# STEP 1: PREPARE MARINE REGIONS (Final Scientific Selection)
 # ------------------------------------------------------------------------------
 
 # !!! MASTER SWITCH !!!
-# "REPLICATION" = Matches Paper Guy (Tropical + Specific Temperate)
-# "EXPANSION"   = Thesis Scope (Tropical + Wider Expansion Zones)
-PIPELINE_MODE <- "REPLICATION" 
+# "REPLICATION" = Strict Match (27 Provs, No Easter Island) -> Saves *_strict files
+# "EXPANSION"   = Validated Thesis Scope (Replication + SE Australia ONLY) -> Saves standard files
+PIPELINE_MODE <- "EXPANSION" 
 
 if(!require("pacman")) install.packages("pacman")
 pacman::p_load(sf, dplyr, readr, terra)
 
-# --- CONFIG ---
 BASE_DIR <- getwd()
 DATA_DIR <- file.path(BASE_DIR, "data")
 SHP_DIR  <- file.path(DATA_DIR, "shapefiles")
 MEOW_SHP <- file.path(SHP_DIR, "meow_ecos.shp")
+PAPER_GUY_FILE <- file.path(DATA_DIR, "paper_guy_meow_ecos_df.csv")
 
 cat("--- RUNNING IN", PIPELINE_MODE, "MODE ---\n")
 
-# --- 1. LOAD SHAPEFILE ---
-cat("Loading MEOW Shapefile...\n")
-regions <- st_read(MEOW_SHP, quiet = TRUE)
-
-# --- 2. DEFINE REGIONS (Hard-Coded Raw Names) ---
-# Note: These names match the raw shapefile BEFORE any underscores are added.
-
+# 1. DEFINE FILE NAMES BASED ON MODE
 if (PIPELINE_MODE == "REPLICATION") {
-  cat("Selecting Paper Guy Scope...\n")
-  
-  # A. Tropical Core
-  tropical_realms <- c(
-    "Central Indo-Pacific",
-    "Eastern Indo-Pacific",
-    "Western Indo-Pacific"
-  )
-  
-  # B. Specific "Temperate" Additions (Paper Guy includes these)
-  force_include <- c(
-    "West Central Australian Shelf",    # Ningaloo
-    "East Central Australian Shelf",    # Southern GBR
-    "Warm Temperate Northwest Pacific", # Southern Japan
-    "Hawaii", 
-    "Easter Island",
-    "Southeast Polynesia"
-  )
-  
-  regions_filtered <- regions %>% 
-    filter(REALM %in% tropical_realms | PROVINCE %in% force_include)
-  
+  OUT_SHP  <- file.path(DATA_DIR, "marine_regions_strict.shp")
+  OUT_CSV  <- file.path(DATA_DIR, "meow_ecos_df_strict.csv")
 } else {
-  cat("Selecting Thesis Expansion Scope...\n")
-  
-  # A. Tropical Core
-  tropical_realms <- c("Central Indo-Pacific", "Eastern Indo-Pacific", "Western Indo-Pacific")
-  
-  # B. Thesis Expansion Zones
-  expansion_provinces <- c(
-    "Warm Temperate Northwest Pacific", # Japan
-    "Southeast Australian Shelf",       # E. Australia
-    "Southwest Australian Shelf",       # W. Australia
-    "West Central Australian Shelf",    # W. Australia
-    "East Central Australian Shelf",    # Transition
-    "Agulhas",                          # S. Africa
-    "Northern New Zealand"              # NZ
-  )
-  
-  regions_filtered <- regions %>% 
-    filter(REALM %in% tropical_realms | PROVINCE %in% expansion_provinces)
+  OUT_SHP  <- file.path(DATA_DIR, "marine_regions.shp")
+  OUT_CSV  <- file.path(DATA_DIR, "meow_ecos_df.csv")
 }
 
+# 2. LOAD & FILTER
+regions <- st_read(MEOW_SHP, quiet = TRUE)
+
+# --- DEFINITIONS ---
+# Paper Guy: 9 (Japan), 18-41 (Tropical), 55 (E. Aus), 58 (W. Aus)
+# Note: 42 (Easter Island) is EXCLUDED.
+strict_codes <- c(9, 18:41, 55, 58)
+
+# --- EXPANSION LOGIC (VALIDATED BY DEEP RESEARCH) ---
+# Valid Expansion:
+# 54 = Southeast Australian Shelf (Realized niche extension for A. latezonatus)
+
+# Rejected False Positives (Commented Out):
+# 51 = Agulhas (Too cold, no anemones)
+# 53 = Northern New Zealand (No resident populations, only vagrants)
+# 57 = Southwest Australian Shelf (Too cold, kelp dominated)
+# 56 = Southern New Zealand (Subantarctic, way too cold)
+
+expansion_codes <- c(strict_codes, 54) 
+
+# Apply Filter
+if (PIPELINE_MODE == "REPLICATION") {
+  target_codes <- strict_codes
+} else {
+  target_codes <- expansion_codes
+}
+
+regions_filtered <- regions %>% filter(PROV_CODE %in% target_codes)
+
 cat("Selected", nrow(regions_filtered), "Provinces.\n")
+if(PIPELINE_MODE == "EXPANSION") cat("Includes SE Australian Shelf (Code 54).\n")
 
-# --- 3. CLEAN UP & EXPORT ---
-# Shift to 0-360
-regions_shifted <- st_shift_longitude(regions_filtered)
-regions_shifted <- st_make_valid(regions_shifted)
+# 3. PROCESS GEOMETRY
+regions_shifted <- st_shift_longitude(regions_filtered) %>% st_make_valid()
 
-# Dissolve by Province
 prov_data <- regions_shifted %>%
   group_by(PROVINCE) %>%
   summarise(
     PROV_CODE = first(PROV_CODE),
     REALM = first(REALM),
-    RLM_CODE = first(RLM_CODE),
-    Lat_Zone = first(Lat_Zone),
     geometry = st_union(geometry)
   ) %>%
-  ungroup() %>%
-  st_make_valid()
+  ungroup() %>% st_make_valid()
 
-# Save Shapefile (Raw Names)
-st_write(prov_data, file.path(DATA_DIR, "marine_regions.shp"), delete_layer = TRUE, quiet=TRUE)
+# 4. SAVE OUTPUTS
+st_write(prov_data, OUT_SHP, delete_layer = TRUE, quiet=TRUE)
 
-# Export CSV for Reference (Raw Names)
+# Generate CSV
 provs_geom <- prov_data %>% st_cast("MULTIPOLYGON") %>% st_cast("POLYGON")
 provs_geom$id <- 1:nrow(provs_geom)
 coords <- st_coordinates(provs_geom) %>% as.data.frame()
 colnames(coords) <- c("long", "lat", "feature", "id")
 meow_df <- left_join(coords, st_drop_geometry(provs_geom), by="id")
 
-write.csv(meow_df, file.path(DATA_DIR, "meow_ecos_df.csv"), row.names=FALSE)
-cat("Saved: meow_ecos_df.csv\n")
+write.csv(meow_df, OUT_CSV, row.names=FALSE)
+cat("Saved Shapefile to:", OUT_SHP, "\n")
+cat("Saved CSV to:      ", OUT_CSV, "\n")
+
+# --- 5. VALIDATION SUMMARY ---
+if(file.exists(PAPER_FILE)) {
+  cat("\n--- COMPARISON VS PAPER GUY ---\n")
+  paper_df <- read_csv(PAPER_FILE, show_col_types=F)
+  paper_provs <- unique(paper_df$PROVINCE)
+  my_provs <- unique(prov_data$PROVINCE)
+  
+  diffs <- setdiff(my_provs, paper_provs)
+  if(length(diffs)==0) cat("Result: PERFECT MATCH with Paper Guy.\n")
+  else {
+    cat("Result: Expansion Provinces added:\n")
+    print(diffs)
+  }
+}
