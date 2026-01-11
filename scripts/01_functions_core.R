@@ -1,6 +1,6 @@
 # scripts/01_functions_core.R
 # ------------------------------------------------------------------------------
-# CORE UTILITIES (Thinning, Background, Logging)
+# CORE UTILITIES (Thinning, Background, Logging, Status helpers)
 # ------------------------------------------------------------------------------
 
 write_log <- function(path, msg) {
@@ -18,10 +18,10 @@ get_bias_corrected_background <- function(occ_coords, env_stack, n_bg=10000, alp
   if(inherits(occ_coords, "data.frame")) occ <- as.matrix(occ_coords[, c("x", "y")])
   else occ <- as.matrix(occ_coords)
   
-  env_cols <- names(env_stack)[1:2] 
+  env_cols <- names(env_stack)[1:2]
   occ_env <- terra::extract(env_stack[[env_cols]], occ)
   occ_env <- na.omit(cbind(occ, occ_env))
-  if(nrow(occ_env) == 0) return(NULL) 
+  if(nrow(occ_env) == 0) return(NULL)
   
   candidates <- terra::spatSample(env_stack, size=n_bg*3, method="random", na.rm=TRUE, xy=TRUE, values=TRUE)
   candidates <- na.omit(candidates)
@@ -72,7 +72,7 @@ get_biotic_layer <- function(fish_sp, host_stack, int_mat, debug_path=NULL) {
   
   row_idx <- which(rownames(int_mat) == fish_clean)
   w_vals <- as.numeric(int_mat[row_idx, ])
-  names(w_vals) <- colnames(int_mat) 
+  names(w_vals) <- colnames(int_mat)
   weights <- w_vals[w_vals > 0]
   
   available_hosts <- intersect(names(weights), names(host_stack))
@@ -90,4 +90,32 @@ get_biotic_layer <- function(fish_sp, host_stack, int_mat, debug_path=NULL) {
   biotic_layer <- terra::weighted.mean(sub_stack, w=sub_weights, na.rm=TRUE)
   names(biotic_layer) <- "biotic_suitability"
   return(biotic_layer)
+}
+
+# ------------------------------------------------------------------------------
+# STATUS HELPERS (for robust skipping)
+# ------------------------------------------------------------------------------
+
+read_status_file <- function(path) {
+  if(!file.exists(path)) return(list(status="NONE", n=0L))
+  txt <- tryCatch(readLines(path, warn=FALSE), error=function(e) character(0))
+  if(length(txt) == 0) return(list(status="NONE", n=0L))
+  line <- txt[1]
+  
+  if(grepl("^SKIP_NO_BIOTIC", line)) return(list(status="SKIP_NO_BIOTIC", n=0L))
+  
+  n <- NA_integer_
+  m <- regmatches(line, regexpr("n=\\d+", line))
+  if(length(m) > 0 && nzchar(m)) n <- as.integer(sub("n=", "", m))
+  
+  if(grepl("^OK", line)) return(list(status="OK", n=n))
+  return(list(status="UNKNOWN", n=n))
+}
+
+write_status_ok <- function(path, n) {
+  writeLines(paste0("OK n=", as.integer(n)), path)
+}
+
+write_status_progress <- function(path, completed, target) {
+  writeLines(paste0("PROGRESS n=", as.integer(completed), "/", as.integer(target)), path)
 }

@@ -2,13 +2,16 @@
 # ------------------------------------------------------------------------------
 # FINAL SDM PIPELINE: GOLD STANDARD (3-Stage Fish + Future Biotic)
 #
-# Robustified:
-# - Stable PSOCK workers + per-worker terra tempdir
-# - Thread caps (BLAS/GDAL/OMP) to avoid oversubscription
-# - Resumable: per-species ".done" status files per stage
-# - Fish split into 3 passes: EnvOnly / HostOnly / Combined
-# - Background coordinates cached per fish species (shared across passes)
-# - Fail-soft: foreach .errorhandling="pass" + tryCatch per species
+# Key robustness features (resumable + gradual skip):
+# - Tuning cached per species + stage
+# - Bootstrap modelling resumable at ITERATION level (iter_###.ok)
+# - Ensemble mean/sd computed from cached sum/sum_sq rasters
+# - Stage status files: OK / PROGRESS / SKIP_NO_BIOTIC
+# - Thinned occurrences saved per species (reporting)
+# - Master log + per-species logs
+#
+# Critical terra stability fix:
+# - Master + workers use dedicated tempdirs and terraOptions(todisk=TRUE)
 # ------------------------------------------------------------------------------
 
 # 1. SETUP ---------------------------------------------------------------------
@@ -30,16 +33,16 @@ source("scripts/02_functions_model.R")
 # HARDENING: prevent oversubscription (terra/GDAL/BLAS threads per worker)
 # ------------------------------------------------------------------------------
 THREAD_ENV <- c(
-  OMP_NUM_THREADS = "1",
-  OPENBLAS_NUM_THREADS = "1",
-  MKL_NUM_THREADS = "1",
+  OMP_NUM_THREADS        = "1",
+  OPENBLAS_NUM_THREADS   = "1",
+  MKL_NUM_THREADS        = "1",
   VECLIB_MAXIMUM_THREADS = "1",
-  NUMEXPR_NUM_THREADS = "1",
-  GDAL_NUM_THREADS = "1"
+  NUMEXPR_NUM_THREADS    = "1",
+  GDAL_NUM_THREADS       = "1"
 )
 do.call(Sys.setenv, as.list(THREAD_ENV))
 
-# GLOBAL SEED FOR REPRODUCIBILITY
+# GLOBAL SEED FOR REPRODUCIBILITY (tuning/partitions; bootstrap uses iter index)
 set.seed(42)
 
 # 3. DIRECTORIES ---------------------------------------------------------------
@@ -57,9 +60,25 @@ DIRS <- c(
   "status/fish_env_only",
   "status/fish_host_only",
   "status/fish_combined",
-  "tmp_terra"
+  "tmp_terra",
+  "occurrences/hosts",
+  "occurrences/fish",
+  "stage_cache/Host",
+  "stage_cache/EnvOnly",
+  "stage_cache/HostOnly",
+  "stage_cache/Combined"
 )
 for (d in DIRS) dir.create(file.path(OUTPUT_ROOT, d), recursive = TRUE, showWarnings = FALSE)
+
+# ---- MASTER terra tempdir + todisk (CRITICAL) ----
+MASTER_TD <- file.path(OUTPUT_ROOT, "tmp_terra", "master")
+dir.create(MASTER_TD, recursive = TRUE, showWarnings = FALSE)
+terra::terraOptions(
+  tempdir  = MASTER_TD,
+  todisk   = TRUE,
+  memfrac  = 0.25,
+  progress = 0
+)
 
 # 4. AUTO-WIPE -----------------------------------------------------------------
 if (isTRUE(WIPE_PREDICTIONS)) {
@@ -71,32 +90,30 @@ if (isTRUE(WIPE_PREDICTIONS)) {
     try(unlink(file.path(OUTPUT_ROOT, "predictions/current"), recursive = TRUE, force = TRUE), silent = TRUE)
     try(unlink(file.path(OUTPUT_ROOT, "predictions/future"),  recursive = TRUE, force = TRUE), silent = TRUE)
     
-    try(unlink(file.path(OUTPUT_ROOT, "status"),   recursive = TRUE, force = TRUE), silent = TRUE)
-    try(unlink(file.path(OUTPUT_ROOT, "tmp_terra"),recursive = TRUE, force = TRUE), silent = TRUE)
+    try(unlink(file.path(OUTPUT_ROOT, "status"),      recursive = TRUE, force = TRUE), silent = TRUE)
+    try(unlink(file.path(OUTPUT_ROOT, "tmp_terra"),   recursive = TRUE, force = TRUE), silent = TRUE)
+    try(unlink(file.path(OUTPUT_ROOT, "stage_cache"), recursive = TRUE, force = TRUE), silent = TRUE)
+    try(unlink(file.path(OUTPUT_ROOT, "occurrences"), recursive = TRUE, force = TRUE), silent = TRUE)
     
-    dir.create(file.path(OUTPUT_ROOT, "models_stats"), recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "models"),       recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "models_tuning"),recursive = TRUE, showWarnings = FALSE)
+    # recreate
+    for (d in DIRS) dir.create(file.path(OUTPUT_ROOT, d), recursive = TRUE, showWarnings = FALSE)
     
-    dir.create(file.path(OUTPUT_ROOT, "predictions/current/hosts"),         recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "predictions/current/fish_env_only"),  recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "predictions/current/fish_host_only"), recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "predictions/current/fish_combined"),  recursive = TRUE, showWarnings = FALSE)
-    
-    dir.create(file.path(OUTPUT_ROOT, "status/hosts"),         recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "status/fish_env_only"),  recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "status/fish_host_only"), recursive = TRUE, showWarnings = FALSE)
-    dir.create(file.path(OUTPUT_ROOT, "status/fish_combined"),  recursive = TRUE, showWarnings = FALSE)
-    
-    dir.create(file.path(OUTPUT_ROOT, "tmp_terra"), recursive = TRUE, showWarnings = FALSE)
+    # re-apply master terra options after wipe
+    dir.create(MASTER_TD, recursive = TRUE, showWarnings = FALSE)
+    terra::terraOptions(
+      tempdir  = MASTER_TD,
+      todisk   = TRUE,
+      memfrac  = 0.25,
+      progress = 0
+    )
   })
 }
 
 # 5. LOGGING -------------------------------------------------------------------
 MASTER_LOG <- file.path(OUTPUT_ROOT, "pipeline_log.txt")
-if (file.exists(MASTER_LOG)) unlink(MASTER_LOG)
-file.create(MASTER_LOG)
-write_log(MASTER_LOG, paste("--- PIPELINE START | ID:", RUN_ID, "| BG:", BG_SAMPLING_METHOD, "---"))
+if (!file.exists(MASTER_LOG)) file.create(MASTER_LOG)
+write_log(MASTER_LOG, paste0("=== PIPELINE START | ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                             " | ID: ", RUN_ID, " | BG: ", BG_SAMPLING_METHOD, " ==="))
 
 # 6. DATA LOADING --------------------------------------------------------------
 cat("Loading Data...\n")
@@ -143,6 +160,7 @@ fish_run_list <- if (!is.null(TARGET_FISH))  intersect(valid_fish, TARGET_FISH) 
 
 cat("Final Target Hosts:", length(anem_run_list), "\n")
 cat("Final Target Fish:", length(fish_run_list), "\n")
+write_log(MASTER_LOG, paste("Targets | Hosts:", length(anem_run_list), "| Fish:", length(fish_run_list)))
 
 # Precompute fish env vars (PCs + STATIC_VARS) from the first future file (if present)
 ENV_MODEL_VARS <- NULL
@@ -188,7 +206,7 @@ start_cluster <- function(n, tag, output_root, thread_env) {
   cl <- parallel::makeCluster(n, type = "PSOCK", outfile = outfile)
   doParallel::registerDoParallel(cl)
   
-  # Push THREAD_ENV and per-worker terra tempdir using clusterCall (explicit args)
+  # Push THREAD_ENV and per-worker terra tempdir + todisk (CRITICAL)
   parallel::clusterCall(
     cl,
     function(env, out_root) {
@@ -198,7 +216,12 @@ start_cluster <- function(n, tag, output_root, thread_env) {
         pid <- Sys.getpid()
         td  <- file.path(out_root, "tmp_terra", paste0("worker_", pid))
         dir.create(td, recursive = TRUE, showWarnings = FALSE)
-        terra::terraOptions(tempdir = td)
+        terra::terraOptions(
+          tempdir  = td,
+          todisk   = TRUE,
+          memfrac  = 0.25,
+          progress = 0
+        )
       }
       
       Sys.getpid()
@@ -206,7 +229,7 @@ start_cluster <- function(n, tag, output_root, thread_env) {
     thread_env, output_root
   )
   
-  # Load namespaces (quietly) on workers
+  # Load namespaces on workers
   parallel::clusterEvalQ(cl, {
     invisible(lapply(
       c("terra", "dplyr", "readr", "maxnet", "dismo", "ENMeval"),
@@ -216,7 +239,7 @@ start_cluster <- function(n, tag, output_root, thread_env) {
     NULL
   })
   
-  # Handshake (fail fast if worker is dead)
+  # Handshake
   parallel::clusterCall(cl, base::Sys.getpid)
   
   ok <- TRUE
@@ -242,19 +265,19 @@ export_common <- function(cl, extra = character(0), envir = parent.frame()) {
     # funcs
     "write_log", "thin_occurrences", "get_bias_corrected_background", "get_random_background",
     "get_biotic_layer", "get_best_params", "fit_bootstrap_worker",
-    "prepare_future_stack"
+    "prepare_future_stack",
+    "read_status_file", "write_status_ok", "write_status_progress"
   )
   
   parallel::clusterExport(cl, unique(c(base_vars, extra)), envir = envir)
   invisible(TRUE)
 }
 
-# foreach options to avoid “one worker death kills everything” as much as possible
 FOREACH_OPTS <- list(preschedule = FALSE)
 
 # Conservative core usage for stability (terra is IO-heavy)
 N_CORES_HOST <- min(N_CORES, max(1L, length(anem_run_list)))
-N_CORES_FISH <- min(N_CORES, max(1L, length(fish_run_list)), 4L)
+N_CORES_FISH <- min(N_CORES, max(1L, length(fish_run_list)), 10L)
 
 # ==============================================================================
 # PHASE 1: HOSTS
@@ -274,27 +297,37 @@ host_results <- foreach::foreach(
   sp_clean <- gsub(" ", "_", sp)
   
   done_file <- file.path(OUTPUT_ROOT, "status", "hosts", paste0(sp_clean, ".done"))
+  st <- read_status_file(done_file)
   
   stats_file <- file.path(OUTPUT_ROOT, "models_stats",  paste0(sp_clean, "_Host_stats.csv"))
   tune_file  <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_Host_params.csv"))
   pred_mean  <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_mean.tif"))
   pred_sd    <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_sd.tif"))
   
-  if (file.exists(done_file) && file.exists(pred_mean) && file.exists(pred_sd) && file.exists(stats_file)) {
+  # Stage skip only if we reached current target AND outputs exist
+  if (st$status == "OK" && !is.na(st$n) && st$n >= N_HOST_BOOT &&
+      file.exists(pred_mean) && file.exists(pred_sd) && file.exists(stats_file)) {
+    write_log(MASTER_LOG, paste("SKIP Host:", sp_clean, "| already OK n=", st$n))
     return(list(species = sp_clean, stage = "Host", status = "SKIP"))
   }
   
-  write_log(MASTER_LOG, paste("START Host:", sp))
-  sp_log <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, ".log"))
+  write_log(MASTER_LOG, paste("START Host:", sp_clean, "| target iters:", N_HOST_BOOT))
+  sp_log <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, "_Host.log"))
   
   env_stack <- terra::unwrap(packed_env)
   
   out <- tryCatch({
     
-    sp_dat <- dplyr::filter(anem_occ, species == sp)
-    if (nrow(sp_dat) < 5) stop("Not enough occurrences")
-    
-    if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack)
+    # ----- occurrences (thinned) cached for reporting & reproducibility -----
+    occ_out <- file.path(OUTPUT_ROOT, "occurrences", "hosts", paste0(sp_clean, "_occ_used.csv"))
+    if (file.exists(occ_out)) {
+      sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
+    } else {
+      sp_dat <- dplyr::filter(anem_occ, species == sp)
+      if (nrow(sp_dat) < 5) stop("Not enough occurrences")
+      if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack)
+      readr::write_csv(sp_dat, occ_out)
+    }
     
     # Background
     if (BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
@@ -304,7 +337,7 @@ host_results <- foreach::foreach(
     }
     if (is.null(bg_coords) || nrow(bg_coords) < 50) stop("Background sampling failed/too small")
     
-    # Futures
+    # Futures (aligned to current env vars)
     future_stacks <- NULL
     if (isTRUE(HAS_FUT)) {
       future_stacks <- list()
@@ -319,25 +352,33 @@ host_results <- foreach::foreach(
       if (length(future_stacks) == 0) future_stacks <- NULL
     }
     
-    # Tuning
+    # Tuning (cached)
     if (file.exists(tune_file)) {
       params <- readr::read_csv(tune_file, show_col_types = FALSE)
+      write_log(MASTER_LOG, paste("  > Host tuning cached:", sp_clean))
     } else {
-      write_log(MASTER_LOG, paste("  > Tuning Host:", sp))
+      write_log(MASTER_LOG, paste("  > Tuning Host:", sp_clean))
       params <- get_best_params(sp_dat, env_stack, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
       if (is.null(params)) stop("Tuning failed")
       params$fc <- tolower(params$fc)
       readr::write_csv(as.data.frame(params), tune_file)
     }
     
-    # Fit + projections
+    # Fit + projections (RESUMABLE iterations)
     results <- fit_bootstrap_worker(
-      sp_dat, env_stack, future_stacks, bg_coords, params,
+      occ_df = sp_dat,
+      current_stack = env_stack,
+      future_stack_list = future_stacks,
+      bg_coords = bg_coords,
+      params = params,
       n_boot = N_HOST_BOOT,
-      sp_name = sp_clean, model_type = "Host",
-      output_dir = OUTPUT_ROOT, debug_log = sp_log
+      sp_name = sp_clean,
+      model_type = "Host",
+      output_dir = OUTPUT_ROOT,
+      debug_log = sp_log
     )
     
+    # Save stage-level stats + rasters
     readr::write_csv(results$stats, stats_file)
     terra::writeRaster(results$current$mean, pred_mean, overwrite = TRUE)
     terra::writeRaster(results$current$sd,   pred_sd,   overwrite = TRUE)
@@ -357,12 +398,19 @@ host_results <- foreach::foreach(
       }
     }
     
-    writeLines("OK", done_file)
-    write_log(MASTER_LOG, paste("FINISH Host:", sp))
-    list(species = sp_clean, stage = "Host", status = "OK")
+    # Status file: OK only when completed == target, otherwise PROGRESS
+    if (!is.null(results$completed) && results$completed >= N_HOST_BOOT) {
+      write_status_ok(done_file, N_HOST_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Host:", sp_clean, "| OK n=", N_HOST_BOOT))
+      list(species = sp_clean, stage = "Host", status = "OK", n = N_HOST_BOOT)
+    } else {
+      write_status_progress(done_file, results$completed, N_HOST_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Host:", sp_clean, "| PROGRESS n=", results$completed, "/", N_HOST_BOOT))
+      list(species = sp_clean, stage = "Host", status = "PROGRESS", n = results$completed)
+    }
     
   }, error = function(e) {
-    write_log(MASTER_LOG, paste("ERROR Host:", sp, "->", e$message))
+    write_log(MASTER_LOG, paste("ERROR Host:", sp_clean, "->", e$message))
     list(species = sp_clean, stage = "Host", status = "ERROR", msg = e$message)
   })
   
@@ -374,11 +422,14 @@ base::try(parallel::stopCluster(cl_hosts), silent = TRUE)
 # ==============================================================================
 # PREP HOST STACK (Current) for fish phases
 # ==============================================================================
-host_files <- list.files(file.path(OUTPUT_ROOT, "predictions/current/hosts"), full.names = TRUE, pattern = "_mean\\.tif$")
+host_files <- list.files(
+  file.path(OUTPUT_ROOT, "predictions/current/hosts"),
+  full.names = TRUE, pattern = "_mean\\.tif$"
+)
 if (length(host_files) == 0) stop("CRITICAL: Phase 1 failed (no host rasters found).")
 
 hosts_curr <- terra::rast(host_files)
-names(hosts_curr) <- tools::file_path_sans_ext(basename(host_files)) |> gsub("_mean$", "", x = _)
+names(hosts_curr) <- gsub("_mean$", "", tools::file_path_sans_ext(basename(host_files)))
 packed_hosts_curr <- terra::wrap(hosts_curr)
 
 # ==============================================================================
@@ -404,7 +455,9 @@ fish_env_results <- foreach::foreach(
   sp_clean <- gsub(" ", "_", sp)
   
   done_file <- file.path(OUTPUT_ROOT, "status", "fish_env_only", paste0(sp_clean, ".done"))
-  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, ".log"))
+  st <- read_status_file(done_file)
+  
+  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, "_EnvOnly.log"))
   
   stats_file <- file.path(OUTPUT_ROOT, "models_stats",  paste0(sp_clean, "_FishEnvOnly_stats.csv"))
   tune_file  <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishEnvOnly_params.csv"))
@@ -413,18 +466,27 @@ fish_env_results <- foreach::foreach(
   out_mean <- file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", paste0(sp_clean, "_mean.tif"))
   out_sd   <- file.path(OUTPUT_ROOT, "predictions/current/fish_env_only", paste0(sp_clean, "_sd.tif"))
   
-  if (file.exists(done_file) && file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+  if (st$status == "OK" && !is.na(st$n) && st$n >= N_FISH_BOOT &&
+      file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+    write_log(MASTER_LOG, paste("SKIP Fish EnvOnly:", sp_clean, "| already OK n=", st$n))
     return(list(species = sp_clean, stage = "FishEnvOnly", status = "SKIP"))
   }
   
-  write_log(MASTER_LOG, paste("START Fish EnvOnly:", sp))
+  write_log(MASTER_LOG, paste("START Fish EnvOnly:", sp_clean, "| target iters:", N_FISH_BOOT))
   env_stack_curr <- terra::unwrap(packed_env)
   
   out <- tryCatch({
     
-    sp_dat <- dplyr::filter(amph_occ, species == sp)
-    if (nrow(sp_dat) < 5) stop("Not enough occurrences")
-    if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+    # shared thinned occurrences across all fish passes
+    occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
+    if (file.exists(occ_out)) {
+      sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
+    } else {
+      sp_dat <- dplyr::filter(amph_occ, species == sp)
+      if (nrow(sp_dat) < 5) stop("Not enough occurrences")
+      if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+      readr::write_csv(sp_dat, occ_out)
+    }
     
     vars_present <- intersect(ENV_MODEL_VARS, names(env_stack_curr))
     if (length(vars_present) < 2) stop("Not enough env predictors found for env-only stack")
@@ -457,9 +519,10 @@ fish_env_results <- foreach::foreach(
       if (length(future_stacks_env) == 0) future_stacks_env <- NULL
     }
     
-    # Tuning
+    # Tuning (cached)
     if (file.exists(tune_file)) {
       params_env <- readr::read_csv(tune_file, show_col_types = FALSE)
+      write_log(MASTER_LOG, paste("  > EnvOnly tuning cached:", sp_clean))
     } else {
       params_env <- get_best_params(sp_dat, env_stack_model_a, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
       if (!is.null(params_env)) {
@@ -469,12 +532,18 @@ fish_env_results <- foreach::foreach(
     }
     if (is.null(params_env)) stop("Tuning failed for EnvOnly")
     
-    # Fit + projections
+    # Fit + projections (RESUMABLE iterations)
     res_env <- fit_bootstrap_worker(
-      sp_dat, env_stack_model_a, future_stacks_env, bg_coords, params_env,
+      occ_df = sp_dat,
+      current_stack = env_stack_model_a,
+      future_stack_list = future_stacks_env,
+      bg_coords = bg_coords,
+      params = params_env,
       n_boot = N_FISH_BOOT,
-      sp_name = sp_clean, model_type = "EnvOnly",
-      output_dir = OUTPUT_ROOT, debug_log = sp_log
+      sp_name = sp_clean,
+      model_type = "EnvOnly",
+      output_dir = OUTPUT_ROOT,
+      debug_log = sp_log
     )
     
     readr::write_csv(res_env$stats, stats_file)
@@ -496,12 +565,18 @@ fish_env_results <- foreach::foreach(
       }
     }
     
-    writeLines("OK", done_file)
-    write_log(MASTER_LOG, paste("FINISH Fish EnvOnly:", sp))
-    list(species = sp_clean, stage = "FishEnvOnly", status = "OK")
+    if (!is.null(res_env$completed) && res_env$completed >= N_FISH_BOOT) {
+      write_status_ok(done_file, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish EnvOnly:", sp_clean, "| OK n=", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishEnvOnly", status = "OK", n = N_FISH_BOOT)
+    } else {
+      write_status_progress(done_file, res_env$completed, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish EnvOnly:", sp_clean, "| PROGRESS n=", res_env$completed, "/", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishEnvOnly", status = "PROGRESS", n = res_env$completed)
+    }
     
   }, error = function(e) {
-    write_log(MASTER_LOG, paste("ERROR Fish EnvOnly:", sp, "->", e$message))
+    write_log(MASTER_LOG, paste("ERROR Fish EnvOnly:", sp_clean, "->", e$message))
     list(species = sp_clean, stage = "FishEnvOnly", status = "ERROR", msg = e$message)
   })
   
@@ -523,7 +598,15 @@ fish_host_results <- foreach::foreach(
   sp_clean <- gsub(" ", "_", sp)
   
   done_file <- file.path(OUTPUT_ROOT, "status", "fish_host_only", paste0(sp_clean, ".done"))
-  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, ".log"))
+  st <- read_status_file(done_file)
+  
+  # hard skip if biotic absent previously
+  if (st$status == "SKIP_NO_BIOTIC") {
+    write_log(MASTER_LOG, paste("SKIP Fish HostOnly:", sp_clean, "| status SKIP_NO_BIOTIC"))
+    return(list(species = sp_clean, stage = "FishHostOnly", status = "SKIP_NO_BIOTIC"))
+  }
+  
+  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, "_HostOnly.log"))
   
   stats_file <- file.path(OUTPUT_ROOT, "models_stats",  paste0(sp_clean, "_FishHostOnly_stats.csv"))
   tune_file  <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishHostOnly_params.csv"))
@@ -532,27 +615,36 @@ fish_host_results <- foreach::foreach(
   out_mean <- file.path(OUTPUT_ROOT, "predictions/current/fish_host_only", paste0(sp_clean, "_mean.tif"))
   out_sd   <- file.path(OUTPUT_ROOT, "predictions/current/fish_host_only", paste0(sp_clean, "_sd.tif"))
   
-  if (file.exists(done_file) && file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+  if (st$status == "OK" && !is.na(st$n) && st$n >= N_FISH_BOOT &&
+      file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+    write_log(MASTER_LOG, paste("SKIP Fish HostOnly:", sp_clean, "| already OK n=", st$n))
     return(list(species = sp_clean, stage = "FishHostOnly", status = "SKIP"))
   }
   
-  write_log(MASTER_LOG, paste("START Fish HostOnly:", sp))
+  write_log(MASTER_LOG, paste("START Fish HostOnly:", sp_clean, "| target iters:", N_FISH_BOOT))
   
   env_stack_curr  <- terra::unwrap(packed_env)
   host_stack_curr <- terra::unwrap(packed_hosts_curr)
   
   out <- tryCatch({
     
-    sp_dat <- dplyr::filter(amph_occ, species == sp)
-    if (nrow(sp_dat) < 5) stop("Not enough occurrences")
-    if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+    # shared thinned occurrences
+    occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
+    if (file.exists(occ_out)) {
+      sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
+    } else {
+      sp_dat <- dplyr::filter(amph_occ, species == sp)
+      if (nrow(sp_dat) < 5) stop("Not enough occurrences")
+      if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+      readr::write_csv(sp_dat, occ_out)
+    }
     
     if (!("rugosity" %in% names(env_stack_curr))) stop("Missing rugosity layer for HostOnly")
     rug_layer <- env_stack_curr[["rugosity"]]
     
     biotic_curr <- get_biotic_layer(sp, host_stack_curr, int_mat, debug_path = MASTER_LOG)
     if (is.null(biotic_curr)) {
-      write_log(MASTER_LOG, paste("SKIP Fish HostOnly:", sp, "-> no biotic layer"))
+      write_log(MASTER_LOG, paste("SKIP Fish HostOnly:", sp_clean, "-> no biotic layer"))
       writeLines("SKIP_NO_BIOTIC", done_file)
       return(list(species = sp_clean, stage = "FishHostOnly", status = "SKIP_NO_BIOTIC"))
     }
@@ -560,7 +652,7 @@ fish_host_results <- foreach::foreach(
     host_only_stack <- c(rug_layer, biotic_curr)
     names(host_only_stack) <- c("rugosity", "biotic_suitability")
     
-    # Background (cached; compute using EnvOnly stack if needed)
+    # Background (cached; built from EnvOnly env stack)
     if (file.exists(bg_file)) {
       bg_coords <- readRDS(bg_file)
     } else {
@@ -577,7 +669,7 @@ fish_host_results <- foreach::foreach(
       saveRDS(bg_coords, bg_file)
     }
     
-    # Futures: static rugosity + future biotic from future host predictions
+    # Futures: rugosity + future biotic from future host predictions
     future_stacks_hostonly <- NULL
     if (isTRUE(HAS_FUT)) {
       future_stacks_hostonly <- list()
@@ -594,7 +686,7 @@ fish_host_results <- foreach::foreach(
         if (length(host_files_fut) == 0) next
         
         h_stack_f <- terra::rast(host_files_fut)
-        names(h_stack_f) <- tools::file_path_sans_ext(basename(host_files_fut)) |> gsub("_mean$", "", x = _)
+        names(h_stack_f) <- gsub("_mean$", "", tools::file_path_sans_ext(basename(host_files_fut)))
         
         biotic_fut <- get_biotic_layer(sp, h_stack_f, int_mat)
         if (is.null(biotic_fut)) next
@@ -607,9 +699,10 @@ fish_host_results <- foreach::foreach(
       if (length(future_stacks_hostonly) == 0) future_stacks_hostonly <- NULL
     }
     
-    # Tuning
+    # Tuning (cached)
     if (file.exists(tune_file)) {
       params_host <- readr::read_csv(tune_file, show_col_types = FALSE)
+      write_log(MASTER_LOG, paste("  > HostOnly tuning cached:", sp_clean))
     } else {
       params_host <- get_best_params(sp_dat, host_only_stack, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
       if (!is.null(params_host)) {
@@ -619,12 +712,18 @@ fish_host_results <- foreach::foreach(
     }
     if (is.null(params_host)) stop("Tuning failed for HostOnly")
     
-    # Fit + projections
+    # Fit + projections (RESUMABLE)
     res_ho <- fit_bootstrap_worker(
-      sp_dat, host_only_stack, future_stacks_hostonly, bg_coords, params_host,
+      occ_df = sp_dat,
+      current_stack = host_only_stack,
+      future_stack_list = future_stacks_hostonly,
+      bg_coords = bg_coords,
+      params = params_host,
       n_boot = N_FISH_BOOT,
-      sp_name = sp_clean, model_type = "HostOnly",
-      output_dir = OUTPUT_ROOT, debug_log = sp_log
+      sp_name = sp_clean,
+      model_type = "HostOnly",
+      output_dir = OUTPUT_ROOT,
+      debug_log = sp_log
     )
     
     readr::write_csv(res_ho$stats, stats_file)
@@ -646,12 +745,18 @@ fish_host_results <- foreach::foreach(
       }
     }
     
-    writeLines("OK", done_file)
-    write_log(MASTER_LOG, paste("FINISH Fish HostOnly:", sp))
-    list(species = sp_clean, stage = "FishHostOnly", status = "OK")
+    if (!is.null(res_ho$completed) && res_ho$completed >= N_FISH_BOOT) {
+      write_status_ok(done_file, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish HostOnly:", sp_clean, "| OK n=", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishHostOnly", status = "OK", n = N_FISH_BOOT)
+    } else {
+      write_status_progress(done_file, res_ho$completed, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish HostOnly:", sp_clean, "| PROGRESS n=", res_ho$completed, "/", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishHostOnly", status = "PROGRESS", n = res_ho$completed)
+    }
     
   }, error = function(e) {
-    write_log(MASTER_LOG, paste("ERROR Fish HostOnly:", sp, "->", e$message))
+    write_log(MASTER_LOG, paste("ERROR Fish HostOnly:", sp_clean, "->", e$message))
     list(species = sp_clean, stage = "FishHostOnly", status = "ERROR", msg = e$message)
   })
   
@@ -673,7 +778,14 @@ fish_comb_results <- foreach::foreach(
   sp_clean <- gsub(" ", "_", sp)
   
   done_file <- file.path(OUTPUT_ROOT, "status", "fish_combined", paste0(sp_clean, ".done"))
-  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, ".log"))
+  st <- read_status_file(done_file)
+  
+  if (st$status == "SKIP_NO_BIOTIC") {
+    write_log(MASTER_LOG, paste("SKIP Fish Combined:", sp_clean, "| status SKIP_NO_BIOTIC"))
+    return(list(species = sp_clean, stage = "FishCombined", status = "SKIP_NO_BIOTIC"))
+  }
+  
+  sp_log    <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, "_Combined.log"))
   
   stats_file <- file.path(OUTPUT_ROOT, "models_stats",  paste0(sp_clean, "_FishCombined_stats.csv"))
   tune_file  <- file.path(OUTPUT_ROOT, "models_tuning", paste0(sp_clean, "_FishCombined_params.csv"))
@@ -682,20 +794,29 @@ fish_comb_results <- foreach::foreach(
   out_mean <- file.path(OUTPUT_ROOT, "predictions/current/fish_combined", paste0(sp_clean, "_mean.tif"))
   out_sd   <- file.path(OUTPUT_ROOT, "predictions/current/fish_combined", paste0(sp_clean, "_sd.tif"))
   
-  if (file.exists(done_file) && file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+  if (st$status == "OK" && !is.na(st$n) && st$n >= N_FISH_BOOT &&
+      file.exists(out_mean) && file.exists(out_sd) && file.exists(stats_file)) {
+    write_log(MASTER_LOG, paste("SKIP Fish Combined:", sp_clean, "| already OK n=", st$n))
     return(list(species = sp_clean, stage = "FishCombined", status = "SKIP"))
   }
   
-  write_log(MASTER_LOG, paste("START Fish Combined:", sp))
+  write_log(MASTER_LOG, paste("START Fish Combined:", sp_clean, "| target iters:", N_FISH_BOOT))
   
   env_stack_curr  <- terra::unwrap(packed_env)
   host_stack_curr <- terra::unwrap(packed_hosts_curr)
   
   out <- tryCatch({
     
-    sp_dat <- dplyr::filter(amph_occ, species == sp)
-    if (nrow(sp_dat) < 5) stop("Not enough occurrences")
-    if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+    # shared thinned occurrences
+    occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
+    if (file.exists(occ_out)) {
+      sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
+    } else {
+      sp_dat <- dplyr::filter(amph_occ, species == sp)
+      if (nrow(sp_dat) < 5) stop("Not enough occurrences")
+      if (isTRUE(USE_SPATIAL_THINNING)) sp_dat <- thin_occurrences(sp_dat, env_stack_curr)
+      readr::write_csv(sp_dat, occ_out)
+    }
     
     vars_present <- intersect(ENV_MODEL_VARS, names(env_stack_curr))
     if (length(vars_present) < 2) stop("Not enough env predictors found for combined env stack")
@@ -703,7 +824,7 @@ fish_comb_results <- foreach::foreach(
     
     biotic_curr <- get_biotic_layer(sp, host_stack_curr, int_mat, debug_path = MASTER_LOG)
     if (is.null(biotic_curr)) {
-      write_log(MASTER_LOG, paste("SKIP Fish Combined:", sp, "-> no biotic layer"))
+      write_log(MASTER_LOG, paste("SKIP Fish Combined:", sp_clean, "-> no biotic layer"))
       writeLines("SKIP_NO_BIOTIC", done_file)
       return(list(species = sp_clean, stage = "FishCombined", status = "SKIP_NO_BIOTIC"))
     }
@@ -741,7 +862,7 @@ fish_comb_results <- foreach::foreach(
         if (length(host_files_fut) == 0) next
         
         h_stack_f <- terra::rast(host_files_fut)
-        names(h_stack_f) <- tools::file_path_sans_ext(basename(host_files_fut)) |> gsub("_mean$", "", x = _)
+        names(h_stack_f) <- gsub("_mean$", "", tools::file_path_sans_ext(basename(host_files_fut)))
         
         biotic_fut <- get_biotic_layer(sp, h_stack_f, int_mat)
         if (is.null(biotic_fut)) next
@@ -754,9 +875,10 @@ fish_comb_results <- foreach::foreach(
       if (length(future_stacks_comb) == 0) future_stacks_comb <- NULL
     }
     
-    # Tuning
+    # Tuning (cached)
     if (file.exists(tune_file)) {
       params_comb <- readr::read_csv(tune_file, show_col_types = FALSE)
+      write_log(MASTER_LOG, paste("  > Combined tuning cached:", sp_clean))
     } else {
       params_comb <- get_best_params(sp_dat, full_stack_curr, bg_coords, USE_SPATIAL_TUNING, TUNE_ARGS)
       if (!is.null(params_comb)) {
@@ -766,12 +888,18 @@ fish_comb_results <- foreach::foreach(
     }
     if (is.null(params_comb)) stop("Tuning failed for Combined")
     
-    # Fit + projections
+    # Fit + projections (RESUMABLE)
     res_comb <- fit_bootstrap_worker(
-      sp_dat, full_stack_curr, future_stacks_comb, bg_coords, params_comb,
+      occ_df = sp_dat,
+      current_stack = full_stack_curr,
+      future_stack_list = future_stacks_comb,
+      bg_coords = bg_coords,
+      params = params_comb,
       n_boot = N_FISH_BOOT,
-      sp_name = sp_clean, model_type = "Combined",
-      output_dir = OUTPUT_ROOT, debug_log = sp_log
+      sp_name = sp_clean,
+      model_type = "Combined",
+      output_dir = OUTPUT_ROOT,
+      debug_log = sp_log
     )
     
     readr::write_csv(res_comb$stats, stats_file)
@@ -793,12 +921,18 @@ fish_comb_results <- foreach::foreach(
       }
     }
     
-    writeLines("OK", done_file)
-    write_log(MASTER_LOG, paste("FINISH Fish Combined:", sp))
-    list(species = sp_clean, stage = "FishCombined", status = "OK")
+    if (!is.null(res_comb$completed) && res_comb$completed >= N_FISH_BOOT) {
+      write_status_ok(done_file, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish Combined:", sp_clean, "| OK n=", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishCombined", status = "OK", n = N_FISH_BOOT)
+    } else {
+      write_status_progress(done_file, res_comb$completed, N_FISH_BOOT)
+      write_log(MASTER_LOG, paste("FINISH Fish Combined:", sp_clean, "| PROGRESS n=", res_comb$completed, "/", N_FISH_BOOT))
+      list(species = sp_clean, stage = "FishCombined", status = "PROGRESS", n = res_comb$completed)
+    }
     
   }, error = function(e) {
-    write_log(MASTER_LOG, paste("ERROR Fish Combined:", sp, "->", e$message))
+    write_log(MASTER_LOG, paste("ERROR Fish Combined:", sp_clean, "->", e$message))
     list(species = sp_clean, stage = "FishCombined", status = "ERROR", msg = e$message)
   })
   
@@ -809,5 +943,5 @@ fish_comb_results <- foreach::foreach(
 # CLEANUP
 # ------------------------------------------------------------------------------
 base::try(parallel::stopCluster(cl_fish), silent = TRUE)
-write_log(MASTER_LOG, "--- PIPELINE FINISHED ---")
+write_log(MASTER_LOG, paste0("=== PIPELINE FINISHED | ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " ==="))
 cat("Pipeline finished. See log:", MASTER_LOG, "\n")

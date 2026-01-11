@@ -5,7 +5,7 @@
 
 # --- RUN SETTINGS ---
 RUN_ID           <- "final_run"   # "test_run" or "final_run"
-N_CORES          <- 30            # 30 for final
+N_CORES          <- 10            # 30 for final
 WIPE_PREDICTIONS <- FALSE       # Force re-run?
 
 # --- METHODOLOGY TOGGLES ---
@@ -16,55 +16,55 @@ BG_SAMPLING_METHOD    <- "paper_exact" # Options: "paper_exact", "nearest_neighb
 # --- MODEL PARAMETERS ---
 if (RUN_ID == "final_run") {
   N_HOST_BOOT <- 10
-  N_FISH_BOOT <- 2
+  N_FISH_BOOT <- 40
   TUNE_ARGS   <- list(fc = c("L", "LQ", "H", "LQH"), rm = seq(0.5, 4, 0.5))
 } else {
-  N_HOST_BOOT <- 2
+  N_HOST_BOOT <- 3
   N_FISH_BOOT <- 2
   TUNE_ARGS   <- list(fc = c("L", "LQ", "H"), rm = c(1, 2, 5))
 }
 
 # --- SPECIES & VARS ---
-# TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
+TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
 # Amphiprion_fuscocaudatus
-# TARGET_FISH  <- c("Amphiprion_clarkii", "Amphiprion_frenatus")
+TARGET_FISH  <- c("Amphiprion_clarkii", "Amphiprion_frenatus")
 # TARGET_FISH  <- c("Amphiprion_chagosensis", "Amphiprion_ephippium", "Amphiprion_sebae", "Amphiprion_leucokranos", "Amphiprion_chrysogaster")
 TARGET_HOSTS <- NULL
 TARGET_FISH  <- NULL
-
-TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
-
-TARGET_FISH <- c(
-  "Amphiprion_akallopisos",
-  "Amphiprion_akindynos",
-  "Amphiprion_allardi",
-  "Amphiprion_barberi",
-  # "Amphiprion_bicinctus",
-  # "Amphiprion_chagosensis",
-  # "Amphiprion_chrysogaster",
-  # "Amphiprion_chrysopterus",  # Added (was missing in previous list)
-  # "Amphiprion_clarkii",
-  # "Amphiprion_ephippium",
-  # "Amphiprion_frenatus",
-  # "Amphiprion_fuscocaudatus",
-  # "Amphiprion_latezonatus",
-  # "Amphiprion_latifasciatus",
-  # "Amphiprion_leucokranos",
-  # "Amphiprion_mccullochi",
-  # "Amphiprion_melanopus",
-  # "Amphiprion_nigripes",
-  # "Amphiprion_ocellaris",
-  # "Amphiprion_omanensis",
-  # "Amphiprion_pacificus",
-  # "Amphiprion_percula",
-  # "Amphiprion_perideraion",
-  # "Amphiprion_polymnus",
-  # "Amphiprion_rubrocinctus",
-  # "Amphiprion_sandaracinos",
-  # "Amphiprion_sebae",
-  # "Amphiprion_tricinctus",
-  "Premnas_biaculeatus"
-)
+# 
+# TARGET_HOSTS <- c("Entacmaea_quadricolor", "Heteractis_magnifica")
+# 
+# TARGET_FISH <- c(
+#   "Amphiprion_akallopisos",
+#   "Amphiprion_akindynos",
+#   "Amphiprion_allardi",
+#   "Amphiprion_barberi",
+#   # "Amphiprion_bicinctus",
+#   # "Amphiprion_chagosensis",
+#   # "Amphiprion_chrysogaster",
+#   # "Amphiprion_chrysopterus",  # Added (was missing in previous list)
+#   # "Amphiprion_clarkii",
+#   # "Amphiprion_ephippium",
+#   # "Amphiprion_frenatus",
+#   # "Amphiprion_fuscocaudatus",
+#   # "Amphiprion_latezonatus",
+#   # "Amphiprion_latifasciatus",
+#   # "Amphiprion_leucokranos",
+#   # "Amphiprion_mccullochi",
+#   # "Amphiprion_melanopus",
+#   # "Amphiprion_nigripes",
+#   # "Amphiprion_ocellaris",
+#   # "Amphiprion_omanensis",
+#   # "Amphiprion_pacificus",
+#   # "Amphiprion_percula",
+#   # "Amphiprion_perideraion",
+#   # "Amphiprion_polymnus",
+#   # "Amphiprion_rubrocinctus",
+#   # "Amphiprion_sandaracinos",
+#   # "Amphiprion_sebae",
+#   # "Amphiprion_tricinctus",
+#   "Premnas_biaculeatus"
+# )
 
 # STATIC_VARS  <- c("rugosity", "bathymetry", "slope", "aspect") 
 STATIC_VARS  <- c("rugosity") 
