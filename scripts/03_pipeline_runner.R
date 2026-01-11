@@ -14,6 +14,9 @@ source("scripts/00_config.R")
 source("scripts/01_functions_core.R")
 source("scripts/02_functions_model.R")
 
+# GLOBAL SEED FOR REPRODUCIBILITY
+set.seed(42)
+
 # 3. DIRECTORIES
 DIRS <- c("models_stats", "models_tuning", "models", 
           "predictions/current/hosts", 
@@ -63,6 +66,34 @@ anem_occ <- as.data.frame(read_csv("data/anem_occ_env_final_dataset.csv", show_c
 int_mat  <- read.csv("data/interaction_matrix.csv", row.names=1)
 colnames(int_mat) <- gsub("\\.", "_", colnames(int_mat))
 rownames(int_mat) <- gsub("\\.", "_", rownames(int_mat))
+
+
+
+# --- NEW: DEFINE ROBUST SPECIES LIST ---
+# Remove species with < 10 occurrences to avoid crashes
+filter_species <- function(df, min_n=10) {
+  counts <- df %>% count(species)
+  valid <- counts %>% filter(n >= min_n) %>% pull(species)
+  return(intersect(unique(df$species), valid))
+}
+
+valid_anemones <- filter_species(anem_occ, 10)
+valid_fish     <- filter_species(amph_occ, 10)
+
+# Manually exclude problematic ones if known (e.g. from Paper Guy)
+# blacklist <- c("Macrodactyla_doreensis", "Stichodactyla_mertensii")
+blacklist <- c("", "")
+valid_anemones <- setdiff(valid_anemones, blacklist)
+
+if(!is.null(TARGET_HOSTS)) anem_run_list <- intersect(valid_anemones, TARGET_HOSTS) else anem_run_list <- valid_anemones
+if(!is.null(TARGET_FISH)) fish_run_list <- intersect(valid_fish, TARGET_FISH) else fish_run_list <- valid_fish
+
+cat("Final Target Hosts:", length(anem_run_list), "\n")
+cat("Final Target Fish:", length(fish_run_list), "\n")
+
+
+
+
 
 # 7. CLUSTER
 try(stopCluster(cl), silent=TRUE)

@@ -30,7 +30,8 @@ pacman::p_load(tidyverse, terra, tidyterra, lme4, lmerTest, emmeans,
 
 # --- PATHS ---
 # CHANGE THIS to "final_run" when ready
-RUN_ID <- "test_run" 
+# RUN_ID <- "test_run" 
+RUN_ID <- "final_run" 
 
 BASE_DIR  <- here::here("outputs", RUN_ID)
 MODEL_DIR <- file.path(BASE_DIR, "models")

@@ -3,8 +3,12 @@
 # MODELING WRAPPERS
 # ------------------------------------------------------------------------------
 
-get_best_params <- function(occ_df, env_stack, bg_coords, use_spatial, tune_args) {
+get_best_params <- function(occ_df, env_stack, bg_coords, use_spatial, tune_args, seed=42) {
   occ_coords <- occ_df %>% dplyr::select(x, y) %>% as.matrix()
+  
+  # CRITICAL: Set seed for reproducible partitions (k-fold or block)
+  set.seed(seed)
+  
   part_method <- if(use_spatial) "block" else "randomkfold"
   
   tryCatch({
