@@ -1,20 +1,8 @@
 # scripts/03_pipeline_runner.R
 # ------------------------------------------------------------------------------
 # FINAL SDM PIPELINE: GOLD STANDARD (3-Stage Fish + Future Biotic)
-#
-# Key robustness features (resumable + gradual skip):
-# - Tuning cached per species + stage
-# - Bootstrap modelling resumable at ITERATION level (iter_###.ok)
-# - Ensemble mean/sd computed from cached sum/sum_sq rasters
-# - Stage status files: OK / PROGRESS / SKIP_NO_BIOTIC
-# - Thinned occurrences saved per species (reporting)
-# - Master log + per-species logs
-#
-# Critical terra stability fix:
-# - Master + workers use dedicated tempdirs and terraOptions(todisk=TRUE)
 # ------------------------------------------------------------------------------
 
-# 1. SETUP ---------------------------------------------------------------------
 rm(list = ls())
 gc()
 
@@ -24,14 +12,10 @@ pacman::p_load(
   terra, dplyr, readr, ENMeval, maxnet, dismo
 )
 
-# 2. LOAD MODULES --------------------------------------------------------------
 source("scripts/00_config.R")
 source("scripts/01_functions_core.R")
 source("scripts/02_functions_model.R")
 
-# ------------------------------------------------------------------------------
-# HARDENING: prevent oversubscription (terra/GDAL/BLAS threads per worker)
-# ------------------------------------------------------------------------------
 THREAD_ENV <- c(
   OMP_NUM_THREADS        = "1",
   OPENBLAS_NUM_THREADS   = "1",
@@ -42,7 +26,6 @@ THREAD_ENV <- c(
 )
 do.call(Sys.setenv, as.list(THREAD_ENV))
 
-# GLOBAL SEED FOR REPRODUCIBILITY (tuning/partitions; bootstrap uses iter index)
 set.seed(42)
 
 # 3. DIRECTORIES ---------------------------------------------------------------
@@ -70,7 +53,6 @@ DIRS <- c(
 )
 for (d in DIRS) dir.create(file.path(OUTPUT_ROOT, d), recursive = TRUE, showWarnings = FALSE)
 
-# ---- MASTER terra tempdir + todisk (CRITICAL) ----
 MASTER_TD <- file.path(OUTPUT_ROOT, "tmp_terra", "master")
 dir.create(MASTER_TD, recursive = TRUE, showWarnings = FALSE)
 terra::terraOptions(
@@ -95,10 +77,8 @@ if (isTRUE(WIPE_PREDICTIONS)) {
     try(unlink(file.path(OUTPUT_ROOT, "stage_cache"), recursive = TRUE, force = TRUE), silent = TRUE)
     try(unlink(file.path(OUTPUT_ROOT, "occurrences"), recursive = TRUE, force = TRUE), silent = TRUE)
     
-    # recreate
     for (d in DIRS) dir.create(file.path(OUTPUT_ROOT, d), recursive = TRUE, showWarnings = FALSE)
     
-    # re-apply master terra options after wipe
     dir.create(MASTER_TD, recursive = TRUE, showWarnings = FALSE)
     terra::terraOptions(
       tempdir  = MASTER_TD,
@@ -119,16 +99,22 @@ write_log(MASTER_LOG, paste0("=== PIPELINE START | ", format(Sys.time(), "%Y-%m-
 cat("Loading Data...\n")
 
 if (!file.exists(ENV_PATH)) stop("Env Raster missing at: ", ENV_PATH)
-current_env <- terra::rast(ENV_PATH)
+current_env_full <- terra::rast(ENV_PATH)
+
+# Enforce predictor rule globally (PC1-4 + rugosity ONLY; PC5 excluded)
+missing_preds <- setdiff(ENV_PREDICTORS, names(current_env_full))
+if (length(missing_preds) > 0) stop("Missing required predictors in ENV_PATH: ", paste(missing_preds, collapse = ", "))
+
+current_env <- current_env_full[[ENV_PREDICTORS]]
 packed_env  <- terra::wrap(current_env)
+
+write_log(MASTER_LOG, paste("Current env predictors:", paste(names(current_env), collapse = ", ")))
 
 FUT_FILES <- list.files(FUT_DIR, full.names = TRUE, pattern = "\\.tif$")
 HAS_FUT   <- length(FUT_FILES) > 0
 if (!HAS_FUT) warning("No future layers found in: ", FUT_DIR)
-
 scenario_names <- if (HAS_FUT) tools::file_path_sans_ext(basename(FUT_FILES)) else character(0)
 
-# Create future directories
 if (HAS_FUT) {
   for (scen in scenario_names) {
     dir.create(file.path(OUTPUT_ROOT, "predictions/future", scen, "hosts"),          recursive = TRUE, showWarnings = FALSE)
@@ -145,7 +131,6 @@ int_mat  <- utils::read.csv("data/interaction_matrix.csv", row.names = 1)
 colnames(int_mat) <- gsub("\\.", "_", colnames(int_mat))
 rownames(int_mat) <- gsub("\\.", "_", rownames(int_mat))
 
-# Robust species lists: remove species with < min_n occurrences
 filter_species <- function(df, min_n = 10) {
   counts <- dplyr::count(df, species)
   valid  <- dplyr::filter(counts, n >= min_n) |> dplyr::pull(species)
@@ -162,14 +147,8 @@ cat("Final Target Hosts:", length(anem_run_list), "\n")
 cat("Final Target Fish:", length(fish_run_list), "\n")
 write_log(MASTER_LOG, paste("Targets | Hosts:", length(anem_run_list), "| Fish:", length(fish_run_list)))
 
-# Precompute fish env vars (PCs + STATIC_VARS) from the first future file (if present)
-ENV_MODEL_VARS <- NULL
-if (HAS_FUT) {
-  ref_fut <- terra::rast(FUT_FILES[1])
-  ENV_MODEL_VARS <- unique(c(names(ref_fut), STATIC_VARS))
-} else {
-  ENV_MODEL_VARS <- unique(c(names(current_env), STATIC_VARS))
-}
+# Keep compatibility with your older naming
+ENV_MODEL_VARS <- ENV_PREDICTORS
 
 # 7. CLUSTER HELPERS -----------------------------------------------------------
 prepare_future_stack <- function(fut_file, curr_stack, static_names) {
@@ -206,7 +185,6 @@ start_cluster <- function(n, tag, output_root, thread_env) {
   cl <- parallel::makeCluster(n, type = "PSOCK", outfile = outfile)
   doParallel::registerDoParallel(cl)
   
-  # Push THREAD_ENV and per-worker terra tempdir + todisk (CRITICAL)
   parallel::clusterCall(
     cl,
     function(env, out_root) {
@@ -229,7 +207,6 @@ start_cluster <- function(n, tag, output_root, thread_env) {
     thread_env, output_root
   )
   
-  # Load namespaces on workers
   parallel::clusterEvalQ(cl, {
     invisible(lapply(
       c("terra", "dplyr", "readr", "maxnet", "dismo", "ENMeval"),
@@ -239,7 +216,6 @@ start_cluster <- function(n, tag, output_root, thread_env) {
     NULL
   })
   
-  # Handshake
   parallel::clusterCall(cl, base::Sys.getpid)
   
   ok <- TRUE
@@ -257,16 +233,33 @@ export_common <- function(cl, extra = character(0), envir = parent.frame()) {
   
   base_vars <- c(
     # data / paths
-    "packed_env", "FUT_FILES", "scenario_names", "HAS_FUT", "STATIC_VARS", "ENV_MODEL_VARS",
+    "packed_env", "FUT_FILES", "scenario_names", "HAS_FUT",
+    "STATIC_VARS", "ENV_MODEL_VARS", "ENV_PREDICTORS", "ENV_PCS",
     "amph_occ", "anem_occ", "int_mat", "OUTPUT_ROOT", "MASTER_LOG",
+    
     # params
     "N_HOST_BOOT", "N_FISH_BOOT", "TUNE_ARGS",
     "USE_SPATIAL_THINNING", "USE_SPATIAL_TUNING", "BG_SAMPLING_METHOD",
+    
+    # CV / eval settings
+    "CV_METHOD", "CV_FOLDS", "CV_ASSIGNMENT", "STRICT_BLOCKCV",
+    "MIN_TEST_PRES", "MIN_TEST_BG", "EVAL_BG_MAX",
+    "BOOTSTRAP_PRES_WITH_REPLACEMENT", "BOOTSTRAP_BG_WITH_REPLACEMENT",
+    "DO_PERM_IMPORTANCE", "BOYCE_N_BINS",
+    
+    # BG settings
+    "BG_N_BG", "BG_CAND_MULT", "BG_ALPHA", "BG_ENV_VARS", "BG_GEO_METRIC", "BG_BUFFER_M",
+    
     # funcs
-    "write_log", "thin_occurrences", "get_bias_corrected_background", "get_random_background",
-    "get_biotic_layer", "get_best_params", "fit_bootstrap_worker",
+    "write_log", "thin_occurrences",
+    "get_bias_corrected_background", "get_random_background",
+    "get_biotic_layer",
+    "get_best_params", "fit_bootstrap_worker",
     "prepare_future_stack",
-    "read_status_file", "write_status_ok", "write_status_progress"
+    "read_status_file", "write_status_ok", "write_status_progress",
+    
+    # helpers for blockCV + boyce + haversine
+    ".haversine_m", "make_block_quadrant_folds", "assign_spatial_folds", "boyce_index_values"
   )
   
   parallel::clusterExport(cl, unique(c(base_vars, extra)), envir = envir)
@@ -275,7 +268,6 @@ export_common <- function(cl, extra = character(0), envir = parent.frame()) {
 
 FOREACH_OPTS <- list(preschedule = FALSE)
 
-# Conservative core usage for stability (terra is IO-heavy)
 N_CORES_HOST <- min(N_CORES, max(1L, length(anem_run_list)))
 N_CORES_FISH <- min(N_CORES, max(1L, length(fish_run_list)), 10L)
 
@@ -304,7 +296,6 @@ host_results <- foreach::foreach(
   pred_mean  <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_mean.tif"))
   pred_sd    <- file.path(OUTPUT_ROOT, "predictions/current/hosts", paste0(sp_clean, "_sd.tif"))
   
-  # Stage skip only if we reached current target AND outputs exist
   if (st$status == "OK" && !is.na(st$n) && st$n >= N_HOST_BOOT &&
       file.exists(pred_mean) && file.exists(pred_sd) && file.exists(stats_file)) {
     write_log(MASTER_LOG, paste("SKIP Host:", sp_clean, "| already OK n=", st$n))
@@ -314,11 +305,10 @@ host_results <- foreach::foreach(
   write_log(MASTER_LOG, paste("START Host:", sp_clean, "| target iters:", N_HOST_BOOT))
   sp_log <- file.path(OUTPUT_ROOT, "logs", paste0(sp_clean, "_Host.log"))
   
-  env_stack <- terra::unwrap(packed_env)
+  env_stack <- terra::unwrap(packed_env)  # already PC1-4 + rugosity
   
   out <- tryCatch({
     
-    # ----- occurrences (thinned) cached for reporting & reproducibility -----
     occ_out <- file.path(OUTPUT_ROOT, "occurrences", "hosts", paste0(sp_clean, "_occ_used.csv"))
     if (file.exists(occ_out)) {
       sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
@@ -331,9 +321,14 @@ host_results <- foreach::foreach(
     
     # Background
     if (BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
-      bg_coords <- get_bias_corrected_background(sp_dat, env_stack, method = BG_SAMPLING_METHOD)
+      bg_coords <- get_bias_corrected_background(
+        sp_dat, env_stack,
+        n_bg = BG_N_BG, alpha = BG_ALPHA, method = BG_SAMPLING_METHOD,
+        env_cols = BG_ENV_VARS, cand_mult = BG_CAND_MULT, geo_metric = BG_GEO_METRIC,
+        seed = 42
+      )
     } else {
-      bg_coords <- get_random_background(sp_dat, env_stack)
+      bg_coords <- get_random_background(sp_dat, env_stack, n_bg = BG_N_BG, buffer_m = BG_BUFFER_M)
     }
     if (is.null(bg_coords) || nrow(bg_coords) < 50) stop("Background sampling failed/too small")
     
@@ -364,7 +359,6 @@ host_results <- foreach::foreach(
       readr::write_csv(as.data.frame(params), tune_file)
     }
     
-    # Fit + projections (RESUMABLE iterations)
     results <- fit_bootstrap_worker(
       occ_df = sp_dat,
       current_stack = env_stack,
@@ -378,7 +372,6 @@ host_results <- foreach::foreach(
       debug_log = sp_log
     )
     
-    # Save stage-level stats + rasters
     readr::write_csv(results$stats, stats_file)
     terra::writeRaster(results$current$mean, pred_mean, overwrite = TRUE)
     terra::writeRaster(results$current$sd,   pred_sd,   overwrite = TRUE)
@@ -398,7 +391,6 @@ host_results <- foreach::foreach(
       }
     }
     
-    # Status file: OK only when completed == target, otherwise PROGRESS
     if (!is.null(results$completed) && results$completed >= N_HOST_BOOT) {
       write_status_ok(done_file, N_HOST_BOOT)
       write_log(MASTER_LOG, paste("FINISH Host:", sp_clean, "| OK n=", N_HOST_BOOT))
@@ -441,7 +433,7 @@ cl_fish <- start_cluster(N_CORES_FISH, "fish", OUTPUT_ROOT, THREAD_ENV)
 export_common(cl_fish, extra = c("packed_hosts_curr"))
 
 # ------------------------------------------------------------------------------
-# Pass A: ENV ONLY (PCs + STATIC_VARS)
+# Pass A: ENV ONLY (PC1-4 + rugosity)  [MODEL A]
 # ------------------------------------------------------------------------------
 write_log(MASTER_LOG, "--- PHASE 2A: FISH ENV ONLY ---")
 
@@ -477,7 +469,6 @@ fish_env_results <- foreach::foreach(
   
   out <- tryCatch({
     
-    # shared thinned occurrences across all fish passes
     occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
     if (file.exists(occ_out)) {
       sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
@@ -488,24 +479,29 @@ fish_env_results <- foreach::foreach(
       readr::write_csv(sp_dat, occ_out)
     }
     
-    vars_present <- intersect(ENV_MODEL_VARS, names(env_stack_curr))
-    if (length(vars_present) < 2) stop("Not enough env predictors found for env-only stack")
-    env_stack_model_a <- env_stack_curr[[vars_present]]
+    env_stack_model_a <- env_stack_curr[[ENV_PREDICTORS]]
+    if (!all(c(ENV_PCS, "rugosity") %in% names(env_stack_model_a))) stop("EnvOnly stack missing required predictors.")
+    if ("PC5" %in% names(env_stack_model_a)) stop("BUG: PC5 leaked into EnvOnly predictors.")
     
-    # Background (cached)
+    # Background (cached; built from EnvOnly stack)
     if (file.exists(bg_file)) {
       bg_coords <- readRDS(bg_file)
     } else {
       if (BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
-        bg_coords <- get_bias_corrected_background(sp_dat, env_stack_model_a, method = BG_SAMPLING_METHOD)
+        bg_coords <- get_bias_corrected_background(
+          sp_dat, env_stack_model_a,
+          n_bg = BG_N_BG, alpha = BG_ALPHA, method = BG_SAMPLING_METHOD,
+          env_cols = BG_ENV_VARS, cand_mult = BG_CAND_MULT, geo_metric = BG_GEO_METRIC,
+          seed = 42
+        )
       } else {
-        bg_coords <- get_random_background(sp_dat, env_stack_model_a)
+        bg_coords <- get_random_background(sp_dat, env_stack_model_a, n_bg = BG_N_BG, buffer_m = BG_BUFFER_M)
       }
       if (is.null(bg_coords) || nrow(bg_coords) < 50) stop("Background sampling failed/too small")
       saveRDS(bg_coords, bg_file)
     }
     
-    # Futures
+    # Futures (subset to EnvOnly predictors)
     future_stacks_env <- NULL
     if (isTRUE(HAS_FUT)) {
       future_stacks_env <- list()
@@ -532,7 +528,6 @@ fish_env_results <- foreach::foreach(
     }
     if (is.null(params_env)) stop("Tuning failed for EnvOnly")
     
-    # Fit + projections (RESUMABLE iterations)
     res_env <- fit_bootstrap_worker(
       occ_df = sp_dat,
       current_stack = env_stack_model_a,
@@ -584,7 +579,7 @@ fish_env_results <- foreach::foreach(
 }
 
 # ------------------------------------------------------------------------------
-# Pass B: HOST ONLY (Rugosity + Biotic)
+# Pass B: HOST ONLY (rugosity + biotic)  [MODEL B]
 # ------------------------------------------------------------------------------
 write_log(MASTER_LOG, "--- PHASE 2B: FISH HOST ONLY ---")
 
@@ -600,7 +595,6 @@ fish_host_results <- foreach::foreach(
   done_file <- file.path(OUTPUT_ROOT, "status", "fish_host_only", paste0(sp_clean, ".done"))
   st <- read_status_file(done_file)
   
-  # hard skip if biotic absent previously
   if (st$status == "SKIP_NO_BIOTIC") {
     write_log(MASTER_LOG, paste("SKIP Fish HostOnly:", sp_clean, "| status SKIP_NO_BIOTIC"))
     return(list(species = sp_clean, stage = "FishHostOnly", status = "SKIP_NO_BIOTIC"))
@@ -628,7 +622,6 @@ fish_host_results <- foreach::foreach(
   
   out <- tryCatch({
     
-    # shared thinned occurrences
     occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
     if (file.exists(occ_out)) {
       sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
@@ -651,19 +644,22 @@ fish_host_results <- foreach::foreach(
     
     host_only_stack <- c(rug_layer, biotic_curr)
     names(host_only_stack) <- c("rugosity", "biotic_suitability")
+    if ("PC5" %in% names(host_only_stack)) stop("BUG: PC5 leaked into HostOnly predictors.")
     
     # Background (cached; built from EnvOnly env stack)
     if (file.exists(bg_file)) {
       bg_coords <- readRDS(bg_file)
     } else {
-      vars_present <- intersect(ENV_MODEL_VARS, names(env_stack_curr))
-      if (length(vars_present) < 2) stop("Not enough env predictors to build bg cache")
-      env_stack_model_a <- env_stack_curr[[vars_present]]
-      
+      env_stack_model_a <- env_stack_curr[[ENV_PREDICTORS]]
       if (BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
-        bg_coords <- get_bias_corrected_background(sp_dat, env_stack_model_a, method = BG_SAMPLING_METHOD)
+        bg_coords <- get_bias_corrected_background(
+          sp_dat, env_stack_model_a,
+          n_bg = BG_N_BG, alpha = BG_ALPHA, method = BG_SAMPLING_METHOD,
+          env_cols = BG_ENV_VARS, cand_mult = BG_CAND_MULT, geo_metric = BG_GEO_METRIC,
+          seed = 42
+        )
       } else {
-        bg_coords <- get_random_background(sp_dat, env_stack_model_a)
+        bg_coords <- get_random_background(sp_dat, env_stack_model_a, n_bg = BG_N_BG, buffer_m = BG_BUFFER_M)
       }
       if (is.null(bg_coords) || nrow(bg_coords) < 50) stop("Background sampling failed/too small")
       saveRDS(bg_coords, bg_file)
@@ -712,7 +708,6 @@ fish_host_results <- foreach::foreach(
     }
     if (is.null(params_host)) stop("Tuning failed for HostOnly")
     
-    # Fit + projections (RESUMABLE)
     res_ho <- fit_bootstrap_worker(
       occ_df = sp_dat,
       current_stack = host_only_stack,
@@ -764,7 +759,7 @@ fish_host_results <- foreach::foreach(
 }
 
 # ------------------------------------------------------------------------------
-# Pass C: COMBINED (EnvOnly predictors + Biotic)
+# Pass C: COMBINED (PC1-4 + rugosity + biotic)  [MODEL C]
 # ------------------------------------------------------------------------------
 write_log(MASTER_LOG, "--- PHASE 2C: FISH COMBINED ---")
 
@@ -807,7 +802,6 @@ fish_comb_results <- foreach::foreach(
   
   out <- tryCatch({
     
-    # shared thinned occurrences
     occ_out <- file.path(OUTPUT_ROOT, "occurrences", "fish", paste0(sp_clean, "_occ_used.csv"))
     if (file.exists(occ_out)) {
       sp_dat <- readr::read_csv(occ_out, show_col_types = FALSE)
@@ -818,9 +812,8 @@ fish_comb_results <- foreach::foreach(
       readr::write_csv(sp_dat, occ_out)
     }
     
-    vars_present <- intersect(ENV_MODEL_VARS, names(env_stack_curr))
-    if (length(vars_present) < 2) stop("Not enough env predictors found for combined env stack")
-    env_stack_model_a <- env_stack_curr[[vars_present]]
+    env_stack_model_a <- env_stack_curr[[ENV_PREDICTORS]]
+    if ("PC5" %in% names(env_stack_model_a)) stop("BUG: PC5 leaked into Combined env predictors.")
     
     biotic_curr <- get_biotic_layer(sp, host_stack_curr, int_mat, debug_path = MASTER_LOG)
     if (is.null(biotic_curr)) {
@@ -832,14 +825,19 @@ fish_comb_results <- foreach::foreach(
     full_stack_curr <- c(env_stack_model_a, biotic_curr)
     names(full_stack_curr) <- c(names(env_stack_model_a), "biotic_suitability")
     
-    # Background (cached)
+    # Background (cached; built from EnvOnly env stack)
     if (file.exists(bg_file)) {
       bg_coords <- readRDS(bg_file)
     } else {
       if (BG_SAMPLING_METHOD %in% c("paper_exact", "nearest_neighbor")) {
-        bg_coords <- get_bias_corrected_background(sp_dat, env_stack_model_a, method = BG_SAMPLING_METHOD)
+        bg_coords <- get_bias_corrected_background(
+          sp_dat, env_stack_model_a,
+          n_bg = BG_N_BG, alpha = BG_ALPHA, method = BG_SAMPLING_METHOD,
+          env_cols = BG_ENV_VARS, cand_mult = BG_CAND_MULT, geo_metric = BG_GEO_METRIC,
+          seed = 42
+        )
       } else {
-        bg_coords <- get_random_background(sp_dat, env_stack_model_a)
+        bg_coords <- get_random_background(sp_dat, env_stack_model_a, n_bg = BG_N_BG, buffer_m = BG_BUFFER_M)
       }
       if (is.null(bg_coords) || nrow(bg_coords) < 50) stop("Background sampling failed/too small")
       saveRDS(bg_coords, bg_file)
@@ -888,7 +886,6 @@ fish_comb_results <- foreach::foreach(
     }
     if (is.null(params_comb)) stop("Tuning failed for Combined")
     
-    # Fit + projections (RESUMABLE)
     res_comb <- fit_bootstrap_worker(
       occ_df = sp_dat,
       current_stack = full_stack_curr,
@@ -939,9 +936,6 @@ fish_comb_results <- foreach::foreach(
   out
 }
 
-# ------------------------------------------------------------------------------
-# CLEANUP
-# ------------------------------------------------------------------------------
 base::try(parallel::stopCluster(cl_fish), silent = TRUE)
 write_log(MASTER_LOG, paste0("=== PIPELINE FINISHED | ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " ==="))
 cat("Pipeline finished. See log:", MASTER_LOG, "\n")
